@@ -520,3 +520,132 @@ test('same-name tools from different servers are flagged as shadowing', { concur
   assert.equal(database.baselines.beta.echo.status, 'pending');
   assert.ok(database.baselines.alpha.echo.evidence.some(item => item.ruleId === 'R2'));
 });
+
+// ── Regression: update_config via WebSocket replaces stale on-disk servers ──
+test('update_config from extension replaces on-disk servers with workspace servers', { concurrency: false }, async t => {
+  const wss = new WebSocketServer({ port: 0 });
+  await new Promise(resolve => wss.once('listening', resolve));
+  const port = wss.address().port;
+
+  let sentUpdateConfig = false;
+  wss.on('connection', socket => {
+    const workspaceConfig = {
+      servers: [{
+        name: 'workspace-server',
+        command: process.execPath,
+        args: [fixturePath],
+        env: { MOCK_SERVER_NAME: 'workspace-server' }
+      }],
+      forbiddenTransitions: [],
+      geminiApiKey: '',
+      autoApproveSafe: true
+    };
+    socket.send(JSON.stringify({ type: 'update_config', config: workspaceConfig }));
+    sentUpdateConfig = true;
+  });
+
+  const proxy = await startProxy(
+    configFor([mockServer('stale-server')]),
+    { MCP_GUARDIAN_WS_DISABLED: '0', MCP_GUARDIAN_WS_PORT: String(port) }
+  );
+  t.after(async () => {
+    await proxy.stop();
+    await new Promise(resolve => wss.close(resolve));
+  });
+
+  await new Promise(resolve => setTimeout(resolve, 600));
+  assert.ok(sentUpdateConfig, 'mock WS server must have sent update_config');
+
+  await proxy.request(1, 'initialize', { protocolVersion: '2024-11-05', capabilities: {} });
+  const listed = await proxy.request(2, 'tools/list');
+
+  assert.ok(!listed.error, `tools/list must not error: ${JSON.stringify(listed.error)}`);
+  const names = listed.result.tools.map(tool => tool.name);
+  assert.ok(names.some(n => n.startsWith('workspace-server__')),
+    `Expected workspace-server tools; got: ${names.join(', ')}`);
+  assert.ok(!names.some(n => n.startsWith('stale-server__')),
+    `Stale server tools must not appear; got: ${names.join(', ')}`);
+});
+
+test('explicit workspace settings survive a stale extension update', { concurrency: false }, async t => {
+  const storage = fs.mkdtempSync(path.join(os.tmpdir(), 'guardian-workspace-config-'));
+  const settingsPath = path.join(storage, 'settings.json');
+  fs.writeFileSync(settingsPath, JSON.stringify({
+    'mcp-guardian.servers': [mockServer('workspace-server')],
+    'mcp-guardian.autoApproveSafe': false,
+    'mcp-guardian.sessionIntent': 'Read test files',
+    'mcp-guardian.allowedCapabilities': ['READ_LOCAL']
+  }));
+  const wss = new WebSocketServer({ port: 0 });
+  await new Promise(resolve => wss.once('listening', resolve));
+  wss.on('connection', socket => {
+    socket.send(JSON.stringify({ type: 'update_config', config: configFor([mockServer('stale-server')]).config }));
+  });
+  const proxy = await startProxy(configFor([mockServer('stale-server')]), {
+    MCP_GUARDIAN_WS_DISABLED: '0',
+    MCP_GUARDIAN_WS_PORT: String(wss.address().port),
+    MCP_GUARDIAN_WORKSPACE_SETTINGS_PATH: settingsPath
+  }, storage);
+  t.after(async () => {
+    await proxy.stop();
+    await new Promise(resolve => wss.close(resolve));
+  });
+  const initialized = await proxy.request(1, 'initialize', { protocolVersion: '2024-11-05', capabilities: {} });
+  assert.ok(initialized.result, JSON.stringify(initialized.error));
+  const listed = await proxy.request(2, 'tools/list');
+  assert.ok(listed.result, JSON.stringify(listed.error));
+  assert.ok(listed.result.tools.some(tool => tool.name.startsWith('workspace-server__')));
+  assert.ok(!listed.result.tools.some(tool => tool.name.startsWith('stale-server__')));
+  await proxy.stop();
+  assert.match(proxy.stderr(), /Starting downstream server 'workspace-server'/);
+  assert.doesNotMatch(proxy.stderr(), /Starting downstream server 'stale-server'/);
+});
+
+// ── Regression: a slow downstream must finish initialize before discovery ──
+test('initialize waits for a slow downstream before exposing tools', { concurrency: false }, async t => {
+  const proxy = await startProxy(configFor([mockServer('alpha', 'delayed-initialize')]));
+  t.after(() => proxy.stop());
+  const started = Date.now();
+  await proxy.request(1, 'initialize', { protocolVersion: '2024-11-05', capabilities: {} });
+  assert.ok(Date.now() - started >= 450, 'Guardian must wait for the downstream initialize response');
+  proxy.notify('notifications/initialized');
+  const listed = await proxy.request(2, 'tools/list');
+  assert.ok(!listed.error, `tools/list must succeed after delay: ${JSON.stringify(listed.error)}`);
+  assert.ok(listed.result.tools.length > 0, 'Must discover at least one tool after delay');
+});
+
+test('a downstream that exits after spawning reports discovery failure', { concurrency: false }, async t => {
+  const proxy = await startProxy(configFor([{
+    name: 'failed-npx-like-process',
+    command: process.execPath,
+    args: ['-e', 'process.exit(7)']
+  }]));
+  t.after(() => proxy.stop());
+  await proxy.request(1, 'initialize', { protocolVersion: '2024-11-05', capabilities: {} });
+  const listed = await proxy.request(2, 'tools/list');
+  assert.ok(listed.error, 'Discovery must fail when a spawned process exits unsuccessfully');
+  assert.match(JSON.stringify(listed.error), /exited with code 7/);
+});
+
+// ── Regression: failed downstream start produces explicit error not zero tools ──
+test('a downstream server that fails to start produces an explicit discovery error', { concurrency: false }, async t => {
+  const badServer = {
+    name: 'bad-server',
+    command: 'this-command-does-not-exist-agent-guardian-test',
+    args: []
+  };
+  const proxy = await startProxy(
+    configFor([badServer]),
+    { MCP_GUARDIAN_REQUEST_TIMEOUT_MS: '500' }
+  );
+  t.after(() => proxy.stop());
+  await proxy.request(1, 'initialize', { protocolVersion: '2024-11-05', capabilities: {} });
+  // Give the event loop time to deliver the async spawn-error event before querying tools.
+  await new Promise(resolve => setTimeout(resolve, 300));
+  const listed = await proxy.request(2, 'tools/list');
+  assert.ok(listed.error, 'tools/list must return an error when downstream fails to start');
+  assert.ok(
+    listed.error.code === -32001 || listed.error.code === -32000,
+    `Expected error code -32001 or -32000, got ${listed.error.code}`
+  );
+});

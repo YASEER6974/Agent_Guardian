@@ -15,7 +15,7 @@ reader.on('line', line => {
   const message = JSON.parse(line);
 
   if (message.method === 'initialize') {
-    respond({
+    const response = {
       jsonrpc: '2.0',
       id: message.id,
       result: {
@@ -23,7 +23,9 @@ reader.on('line', line => {
         capabilities: { tools: {} },
         serverInfo: { name: serverName, version: '1.0.0' }
       }
-    });
+    };
+    if (mode === 'delayed-initialize') setTimeout(() => respond(response), 500);
+    else respond(response);
     return;
   }
 

@@ -1,4 +1,5 @@
 import * as crypto from 'crypto';
+import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as readline from 'readline';
@@ -28,6 +29,7 @@ import {
   AuditLog,
   DownstreamServerConfig,
   ExtensionMessage,
+  GuardianConfig,
   ProxyMessage,
   ResourceLimits
 } from './types';
@@ -77,11 +79,15 @@ const SESSION_TIMEOUT_MS = 2 * 60 * 1000;
 const STORAGE_PATH = process.env.MCP_GUARDIAN_STORAGE_PATH || path.join(os.homedir(), '.mcp-guardian');
 const WS_DISABLED = process.env.MCP_GUARDIAN_WS_DISABLED === '1';
 const WS_PORT = Number(process.env.MCP_GUARDIAN_WS_PORT) || 1337;
+const WORKSPACE_SETTINGS_PATH = process.env.MCP_GUARDIAN_WORKSPACE_SETTINGS_PATH;
 
 const db = new GuardianDb(STORAGE_PATH);
+if (WORKSPACE_SETTINGS_PATH) db.updateConfig(readWorkspaceSettings(WORKSPACE_SETTINGS_PATH));
 const acceptedRisks = new AcceptedRiskStore(STORAGE_PATH);
 const crossSurfaceStore = new CrossSurfaceStore(STORAGE_PATH);
 const downstreams = new Map<string, DownstreamRuntime>();
+const failedDownstreams = new Map<string, string>(); // serverName -> error message
+const downstreamInitialization = new Map<string, Promise<void>>();
 const pendingDownstream = new Map<string, PendingDownstreamRequest>();
 const pendingApprovals = new Map<string, PendingApproval>();
 const sessions = new Map<string, SessionState>();
@@ -92,12 +98,42 @@ let requestSequence = 0;
 let ws: WebSocket | null = null;
 let wsConnected = false;
 let wsReconnectTimer: NodeJS.Timeout | undefined;
+let startupSyncTimer: NodeJS.Timeout | undefined;
 let shuttingDown = false;
+let clientInitializeParams: unknown;
+let clientHasInitialized = false;
+let resolveStartupConfig: (() => void) | undefined;
+const startupConfigReady = new Promise<void>(resolve => { resolveStartupConfig = resolve; });
 
 const clientReader = readline.createInterface({ input: process.stdin, terminal: false });
 
 function limits(): ResourceLimits {
   return { ...DEFAULT_LIMITS, ...(db.getConfig().resourceLimits || {}) };
+}
+
+function readWorkspaceSettings(settingsPath: string): Partial<GuardianConfig> {
+  const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8')) as Record<string, unknown>;
+  const servers = settings['mcp-guardian.servers'];
+  if (!Array.isArray(servers) || servers.length === 0 ||
+      servers.some(server => !server || typeof server.name !== 'string' || !server.name ||
+        typeof server.command !== 'string' || !server.command ||
+        (server.args !== undefined && (!Array.isArray(server.args) || server.args.some((arg: unknown) => typeof arg !== 'string'))))) {
+    throw new Error(`Workspace Guardian settings contain no valid downstream servers: ${settingsPath}`);
+  }
+  const current = db.getConfig();
+  return {
+    servers: servers as DownstreamServerConfig[],
+    autoApproveSafe: typeof settings['mcp-guardian.autoApproveSafe'] === 'boolean'
+      ? settings['mcp-guardian.autoApproveSafe'] : current.autoApproveSafe,
+    sessionPolicy: {
+      intent: typeof settings['mcp-guardian.sessionIntent'] === 'string'
+        ? settings['mcp-guardian.sessionIntent'] : current.sessionPolicy?.intent || '',
+      allowedCapabilities: Array.isArray(settings['mcp-guardian.allowedCapabilities'])
+        ? settings['mcp-guardian.allowedCapabilities'] as string[] : current.sessionPolicy?.allowedCapabilities || [],
+      trustedDestinations: Array.isArray(settings['mcp-guardian.trustedDestinations'])
+        ? settings['mcp-guardian.trustedDestinations'] as string[] : current.sessionPolicy?.trustedDestinations || []
+    }
+  };
 }
 
 function nextRequestId(): string {
@@ -168,6 +204,8 @@ function connectToExtension(): void {
     if (ws !== socket) return;
     wsConnected = true;
     console.error(`[MCP-Guardian-Proxy] Connected to VS Code extension on port ${WS_PORT}`);
+    // Wait for update_config; a connected socket alone does not mean the
+    // extension has supplied its workspace settings yet.
     sendToExtension({
       type: 'sync_state',
       baselines: db.getBaselines(),
@@ -232,7 +270,15 @@ function handleExtensionMessage(message: ExtensionMessage): void {
       sendState();
       return;
     case 'update_config':
-      db.updateConfig(message.config);
+      // Cancel the fallback startup timer — we have the authoritative workspace config now.
+      if (startupSyncTimer !== undefined) {
+        clearTimeout(startupSyncTimer);
+        startupSyncTimer = undefined;
+      }
+      // An explicitly supplied workspace file takes precedence over a stale
+      // extension instance or a different VS Code window sharing this port.
+      db.updateConfig({ ...message.config,
+        ...(WORKSPACE_SETTINGS_PATH ? readWorkspaceSettings(WORKSPACE_SETTINGS_PATH) : {}) });
       syncDownstreamServers();
       return;
     case 'request_state':
@@ -259,6 +305,7 @@ function syncDownstreamServers(): void {
       continue;
     }
     seen.add(server.name);
+    failedDownstreams.delete(server.name); // clear any previous failure so we retry
     const current = downstreams.get(server.name);
     const signature = serverSignature(server);
     if (current && current.signature === signature) continue;
@@ -269,6 +316,11 @@ function syncDownstreamServers(): void {
   for (const name of downstreams.keys()) {
     if (!seen.has(name)) stopDownstreamServer(name, 'removed from configuration');
   }
+  for (const name of failedDownstreams.keys()) {
+    if (!seen.has(name)) failedDownstreams.delete(name);
+  }
+  resolveStartupConfig?.();
+  resolveStartupConfig = undefined;
 }
 
 function startDownstreamServer(config: DownstreamServerConfig): void {
@@ -285,23 +337,34 @@ function startDownstreamServer(config: DownstreamServerConfig): void {
       windowsHide: true
     });
   } catch (error) {
+    const msg = error instanceof Error ? error.message : 'Failed to start server';
+    console.error(`[MCP-Guardian-Proxy] Server '${config.name}' failed to spawn:`, msg);
+    failedDownstreams.set(config.name, msg);
     sendToExtension({
       type: 'downstream_status',
       serverName: config.name,
       status: 'error',
-      error: error instanceof Error ? error.message : 'Failed to start server'
+      error: msg
     });
     return;
   }
 
   if (!child.stdout || !child.stdin) {
     child.kill();
-    throw new Error(`Downstream server '${config.name}' did not expose piped stdio`);
+    const msg = `Downstream server '${config.name}' did not expose piped stdio`;
+    failedDownstreams.set(config.name, msg);
+    throw new Error(msg);
   }
 
   const reader = readline.createInterface({ input: child.stdout, terminal: false });
   const runtime: DownstreamRuntime = { config, signature: serverSignature(config), process: child, reader };
   downstreams.set(config.name, runtime);
+  if (clientHasInitialized) {
+    void initializeDownstream(config.name).catch(error => {
+      console.error(`[MCP-Guardian-Proxy] Downstream initialize failed for '${config.name}':`, error.message);
+      failedDownstreams.set(config.name, error.message);
+    });
+  }
 
   reader.on('line', line => handleDownstreamLine(config.name, line));
   child.once('spawn', () => {
@@ -309,11 +372,18 @@ function startDownstreamServer(config: DownstreamServerConfig): void {
   });
   child.once('error', error => {
     console.error(`[MCP-Guardian-Proxy] Server '${config.name}' error:`, error.message);
+    failedDownstreams.set(config.name, error.message);
     sendToExtension({ type: 'downstream_status', serverName: config.name, status: 'error', error: error.message });
     failPendingForServer(config.name, new Error(`Server '${config.name}' failed: ${error.message}`));
   });
   child.once('close', code => {
-    if (downstreams.get(config.name)?.process === child) downstreams.delete(config.name);
+    if (downstreams.get(config.name)?.process === child) {
+      downstreams.delete(config.name);
+      downstreamInitialization.delete(config.name);
+      const reason = `Server '${config.name}' exited with code ${code}`;
+      console.error(`[MCP-Guardian-Proxy] ${reason}`);
+      if (!shuttingDown && !failedDownstreams.has(config.name)) failedDownstreams.set(config.name, reason);
+    }
     reader.close();
     failPendingForServer(config.name, new Error(`Server '${config.name}' exited with code ${code}`));
     sendToExtension({ type: 'downstream_status', serverName: config.name, status: 'disconnected' });
@@ -324,6 +394,7 @@ function stopDownstreamServer(name: string, reason: string): void {
   const runtime = downstreams.get(name);
   if (!runtime) return;
   downstreams.delete(name);
+  downstreamInitialization.delete(name);
   runtime.reader.close();
   runtime.process.kill();
   failPendingForServer(name, new Error(`Server '${name}' stopped: ${reason}`));
@@ -391,6 +462,19 @@ function requestDownstream(serverName: string, method: string, params: unknown):
   });
 }
 
+function initializeDownstream(serverName: string): Promise<void> {
+  const existing = downstreamInitialization.get(serverName);
+  if (existing) return existing;
+  const initialized = requestDownstream(serverName, 'initialize', clientInitializeParams || {}).then(response => {
+    if (response.error) throw new Error(`Server '${serverName}' rejected initialize: ${response.error.message}`);
+    if (clientHasInitialized) {
+      downstreams.get(serverName)?.process.stdin?.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
+    }
+  });
+  downstreamInitialization.set(serverName, initialized);
+  return initialized;
+}
+
 function notifyDownstreams(method: string, params?: unknown): void {
   const serialized = JSON.stringify({ jsonrpc: '2.0', method, ...(params === undefined ? {} : { params }) }) + '\n';
   for (const runtime of downstreams.values()) runtime.process.stdin?.write(serialized);
@@ -426,10 +510,21 @@ async function handleClientRequest(message: any): Promise<void> {
   }
 
   if (message.method === 'initialize') {
-    for (const name of downstreams.keys()) {
-      void requestDownstream(name, 'initialize', message.params || {}).catch(error => {
-        console.error(`[MCP-Guardian-Proxy] Downstream initialize failed for '${name}':`, error.message);
+    clientInitializeParams = message.params || {};
+    await startupConfigReady;
+    const names = Array.from(downstreams.keys());
+    if (failedDownstreams.size > 0 || names.length === 0) {
+      writeError(message.id ?? null, -32001, 'No healthy downstream MCP servers available', {
+        failures: Array.from(failedDownstreams.entries()).map(([name, error]) => `${name}: ${error}`)
       });
+      return;
+    }
+    const initialized = await Promise.allSettled(names.map(initializeDownstream));
+    const failures = initialized.filter((result): result is PromiseRejectedResult => result.status === 'rejected')
+      .map(result => result.reason instanceof Error ? result.reason.message : String(result.reason));
+    if (failures.length > 0) {
+      writeError(message.id ?? null, -32001, 'Downstream initialization failed', { failures });
+      return;
     }
     writeToClient({
       jsonrpc: '2.0',
@@ -444,6 +539,7 @@ async function handleClientRequest(message: any): Promise<void> {
   }
 
   if (message.method === 'notifications/initialized') {
+    clientHasInitialized = true;
     notifyDownstreams('notifications/initialized', message.params);
     return;
   }
@@ -495,9 +591,19 @@ async function handleClientRequest(message: any): Promise<void> {
 }
 
 async function handleToolsList(message: any): Promise<void> {
+  await startupConfigReady;
+  const initialized = await Promise.allSettled(Array.from(downstreamInitialization.values()));
+  const initializationFailures = initialized.filter((result): result is PromiseRejectedResult => result.status === 'rejected')
+    .map(result => result.reason instanceof Error ? result.reason.message : String(result.reason));
   const serverNames = Array.from(downstreams.keys());
-  if (serverNames.length === 0) {
-    writeToClient({ jsonrpc: '2.0', id: message.id, result: { tools: [] } });
+  // Report any servers that were configured but failed to start.
+  const startupFailures = Array.from(failedDownstreams.entries()).map(
+    ([name, err]) => `Server '${name}' failed to start: ${err}`
+  );
+  if (serverNames.length === 0 || startupFailures.length > 0 || initializationFailures.length > 0) {
+    writeError(message.id ?? null, -32001, 'Tool discovery was incomplete', {
+      failures: [...startupFailures, ...initializationFailures, ...(serverNames.length === 0 ? ['No downstream MCP servers are running'] : [])]
+    });
     return;
   }
 
@@ -742,7 +848,7 @@ async function handleToolCall(message: any): Promise<void> {
     }));
   }
   if (destination && session.policy.trustedDestinations.length > 0 &&
-      !isTrustedDestination(destination, session.policy.trustedDestinations)) {
+    !isTrustedDestination(destination, session.policy.trustedDestinations)) {
     const reason = `Destination '${destination}' is not trusted by the session policy`;
     reasons.push(reason);
     evidence.push(makeEvidence('mcp.session-policy', 'R4', 'high', reason, callEventId, { destination }));
@@ -1111,6 +1217,21 @@ async function shutdown(reason: string): Promise<void> {
   for (const name of Array.from(downstreams.keys())) stopDownstreamServer(name, reason);
 }
 
+
 connectToExtension();
-syncDownstreamServers();
+if (WS_DISABLED || WORKSPACE_SETTINGS_PATH) {
+  // The explicit workspace settings are already loaded, so discovery can start
+  // without waiting for a VS Code extension to connect.
+  syncDownstreamServers();
+} else {
+  // Defer server startup until the extension pushes an update_config message.
+  // This ensures workspace settings.json values (e.g. the filesystem server)
+  // override whatever is in the global ~/.mcp-guardian db.
+  // Fall back to the on-disk config after 3 seconds if the extension never connects.
+  startupSyncTimer = setTimeout(() => {
+    console.error('[MCP-Guardian-Proxy] Extension did not send config within 3 s; starting servers from on-disk config.');
+    startupSyncTimer = undefined;
+    syncDownstreamServers();
+  }, 3_000);
+}
 console.error('[MCP-Guardian-Proxy] Standalone proxy active on stdin/stdout.');

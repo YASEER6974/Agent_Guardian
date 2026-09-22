@@ -18,8 +18,10 @@ const pendingApprovalViews = new Map<string, ApprovalRequestView>();
 export function activate(context: vscode.ExtensionContext) {
   console.log('MCP Guardian is active.');
 
-  // Initialize DB in global home directory for cross-process accessibility
-  const storagePath = path.join(os.homedir(), '.mcp-guardian');
+  // The extension and its proxy must use the same store. A development host
+  // can override this path so another VS Code window cannot replace its config.
+  const runtimeSettings = vscode.workspace.getConfiguration('mcp-guardian');
+  const storagePath = runtimeSettings.get<string>('storagePath') || process.env.MCP_GUARDIAN_STORAGE_PATH || path.join(os.homedir(), '.mcp-guardian');
   db = new GuardianDb(storagePath);
   crossSurfaceStore = new CrossSurfaceStore(storagePath);
 
@@ -44,7 +46,7 @@ export function activate(context: vscode.ExtensionContext) {
   }
 
   // Start WebSocket Server
-  const wsPort = 1337;
+  const wsPort = runtimeSettings.get<number>('wsPort') || Number(process.env.MCP_GUARDIAN_WS_PORT) || 1337;
   startWebSocketServer(wsPort);
 
   // Register Webview Provider
@@ -113,11 +115,12 @@ function startWebSocketServer(port: number) {
       console.log('Proxy connected to WS server');
       activeProxySocket = ws;
 
-      // Sync state immediately
+      // Push the authoritative VS Code configuration as soon as the proxy
+      // connects. The proxy and extension share the on-disk audit store, but
+      // the proxy still needs an update_config message to restart downstream
+      // servers when workspace settings override the global configuration.
       ws.send(JSON.stringify({
-        type: 'sync_state',
-        baselines: db.getBaselines(),
-        logs: db.getLogs(),
+        type: 'update_config',
         config: db.getConfig()
       }));
 

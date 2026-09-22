@@ -31,6 +31,7 @@
     "Other"
   ],
   "activationEvents": [
+    "onStartupFinished",
     "onView:mcp-guardian.dashboard"
   ],
   "main": "./dist/extension.js",
@@ -130,6 +131,16 @@
               ]
             }
           ]
+        },
+        "mcp-guardian.storagePath": {
+          "type": "string",
+          "markdownDescription": "Local Guardian database directory shared by the extension and proxy. Leave empty to use the user home directory.",
+          "default": ""
+        },
+        "mcp-guardian.wsPort": {
+          "type": "number",
+          "markdownDescription": "Local WebSocket port for communication with the Guardian proxy.",
+          "default": 1337
         },
         "mcp-guardian.forbiddenTransitions": {
           "type": "array",
