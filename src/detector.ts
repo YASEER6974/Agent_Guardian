@@ -180,10 +180,10 @@ export function autoAssignCategory(toolName: string, description = ''): string {
   const desc = description.toLowerCase();
 
   const isRead = name.includes('read') || name.includes('get') || name.includes('view') || name.includes('search') || name.includes('list');
-  const isWrite = name.includes('write') || name.includes('send') || name.includes('post') || name.includes('slack') || name.includes('mail') || name.includes('email');
+  const isWrite = /^(?:write|send|post|create|update|delete|remove|drop|alter|deploy|publish|apply|promote|rollback|edit|patch|buy|upload|assign|replace|cancel|start|stop|approve|complete|pause|unpause|activate|revoke|issue|set|upsert|request_promote|request_rollback)(?:_|$)/.test(name) || /(?:slack|mail)/.test(name);
 
   if (name.includes('invoice') || name.includes('finance') || name.includes('billing') || name.includes('bank') || name.includes('payment')) {
-    return 'READ_FINANCIAL';
+    return isWrite ? 'WRITE_COMMUNICATION' : 'READ_FINANCIAL';
   }
 
   if (name.includes('exec') || name.includes('eval') || name.includes('run') || name.includes('bash') || name.includes('command') || name.includes('terminal')) {
@@ -204,8 +204,8 @@ export function autoAssignCategory(toolName: string, description = ''): string {
   }
 
   // General heuristics
-  if (isRead) return 'READ_LOCAL';
   if (isWrite) return 'WRITE_COMMUNICATION';
+  if (isRead) return 'READ_LOCAL';
 
   return 'GENERAL';
 }

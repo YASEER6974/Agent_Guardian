@@ -19,6 +19,9 @@ mcp-guardian-db.json
 # Personal project handbook (keep local, do not publish)
 docs/Agent-Guardian-Complete-Project-Handbook.docx
 
+# Superseded local website draft; hosted site has its own repository
+demo/vercel/
+
 # OS-specific files
 .DS_Store
 Thumbs.db

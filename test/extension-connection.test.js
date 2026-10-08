@@ -30,7 +30,7 @@ async function freePort() {
   return port;
 }
 
-function extensionHost(port, withLaunchEnvironment = true, workspaceConfigured = false) {
+function extensionHost(port, withLaunchEnvironment = true, workspaceConfigured = false, manualApprovals = false) {
   const storage = fs.mkdtempSync(path.join(os.tmpdir(), 'guardian-dashboard-'));
   fs.mkdirSync(path.join(storage, '.vscode'));
   const settingsPath = path.join(storage, '.vscode', 'settings.json');
@@ -88,7 +88,8 @@ function extensionHost(port, withLaunchEnvironment = true, workspaceConfigured =
       showInformationMessage: async message => { information.push(message); },
       showQuickPick: async items => items[0],
       showInputBox: async () => inputQueue.shift(),
-      showWarningMessage: async message => { approvals.push(message); return 'Approve Once'; }
+      showOpenDialog: async () => [{ fsPath: inputQueue.shift() }],
+      showWarningMessage: message => { approvals.push(message); return manualApprovals ? new Promise(() => {}) : Promise.resolve('Approve Once'); }
     },
     commands: { registerCommand: (id, handler) => { commands.set(id, handler); return disposable; } }
   };
@@ -299,6 +300,88 @@ test('workspace routing refuses unresolved interactive credentials before changi
   await host.runCommand('mcp-guardian.guardWorkspaceServers');
   assert.ok(host.errors.some(error => error.includes('interactive inputs')));
   assert.equal(fs.readFileSync(mcpPath, 'utf8'), original);
+});
+
+test('approvals go to their originating proxy and stay pending until authoritative acknowledgement', async t => {
+  const port = await freePort();
+  const host = extensionHost(port, true, false, true);
+  t.after(() => host.deactivate());
+  const first = new WebSocket(`ws://127.0.0.1:${port}`);
+  const second = new WebSocket(`ws://127.0.0.1:${port}`);
+  const receivedFirst = [], receivedSecond = [];
+  first.on('message', value => receivedFirst.push(JSON.parse(value)));
+  second.on('message', value => receivedSecond.push(JSON.parse(value)));
+  t.after(() => { first.terminate(); second.terminate(); });
+  await Promise.all([once(first, 'open'), once(second, 'open')]);
+  const approval = { id: 'owned-by-first', actionFingerprint: 'a'.repeat(64), requestedAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + 60000).toISOString(), serverName: 'external', toolName: 'list_projects',
+    capability: 'READ_NETWORK', sessionId: 'one', intent: 'Inspect', reason: 'Manual approval', arguments: {}, evidence: [] };
+  const log = { id: approval.id, timestamp: approval.requestedAt, serverName: 'external', toolName: 'list_projects',
+    category: 'READ_NETWORK', arguments: {}, status: 'pending', approval: { actionFingerprint: approval.actionFingerprint, expiresAt: approval.expiresAt } };
+  first.send(JSON.stringify({ type: 'log', log }));
+  first.send(JSON.stringify({ type: 'approve_request', approval }));
+  await waitFor(() => host.state().pendingApprovals.length === 1, 'No approval displayed');
+  second.send(JSON.stringify({ type: 'sync_state', baselines: {}, logs: [], config: host.state().config }));
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(host.state().pendingApprovals.length, 1, 'Unrelated snapshot erased the pending request');
+  second.send(JSON.stringify({ type: 'log', log: { ...log, status: 'allow' } }));
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(host.state().logs.some(item => item.id === approval.id && item.status === 'allow'), false, 'Another proxy forged an acknowledgement');
+  host.sendWebview({ type: 'approve_request', id: approval.id, actionFingerprint: approval.actionFingerprint });
+  await waitFor(() => receivedFirst.some(message => message.type === 'approve_response'), 'Reply never reached owner');
+  assert.equal(receivedSecond.some(message => message.type === 'approve_response'), false);
+  assert.equal(host.state().pendingApprovals[0].decisionSubmitted, true);
+  assert.equal(host.state().logs.some(item => item.id === approval.id && item.status === 'allow'), false, 'False optimistic green');
+  host.sendWebview({ type: 'approve_request', id: approval.id, actionFingerprint: approval.actionFingerprint });
+  assert.equal(receivedFirst.filter(message => message.type === 'approve_response').length, 1);
+  first.send(JSON.stringify({ type: 'log', log: { ...log, status: 'allow', reason: 'approved once by user' } }));
+  await waitFor(() => host.state().pendingApprovals.length === 0 && host.state().logs.some(item => item.id === approval.id && item.status === 'allow'), 'Owner acknowledgement was not applied');
+  second.close();
+  await once(second, 'close');
+  assert.equal(host.state().proxyConnected, true, 'Another connected client was incorrectly marked offline');
+});
+
+test('two real proxy processes can both complete approved calls on one dashboard', async t => {
+  const host = extensionHost(await freePort());
+  t.after(() => host.deactivate());
+  const first = startProxy(host.env), second = startProxy(host.env);
+  t.after(() => first.stop()); t.after(() => second.stop());
+  await Promise.all([first.request('initialize', { protocolVersion: '2024-11-05', capabilities: {} }), second.request('initialize', { protocolVersion: '2024-11-05', capabilities: {} })]);
+  await Promise.all([first.request('tools/list'), second.request('tools/list')]);
+  const results = await Promise.all([first.request('tools/call', { name: 'dashboard-test__echo', arguments: { value: 'first' } }), second.request('tools/call', { name: 'dashboard-test__echo', arguments: { value: 'second' } })]);
+  for (const result of results) assert.ok(result.result, JSON.stringify(result.error));
+  assert.equal(host.approvals.length, 2);
+});
+
+test('large provider dashboard snapshots are delivered without relaxing external MCP limits', async t => {
+  const host = extensionHost(await freePort());
+  t.after(() => host.deactivate());
+  const file = path.join(host.storage, 'mcp-guardian-db.json');
+  const stored = JSON.parse(fs.readFileSync(file, 'utf8'));
+  stored.baselines.bulk = { example: { name: 'example', description: 'Large reviewed metadata '.repeat(55000),
+    hash: 'a'.repeat(64), category: 'GENERAL', approved: true, inputSchema: {}, status: 'approved' } };
+  fs.writeFileSync(file, JSON.stringify(stored));
+  const proxy = startProxy(host.env);
+  t.after(() => proxy.stop());
+  await waitFor(() => host.state().baselines.bulk?.example?.description.length > 1048576, 'Large sync_state was silently dropped');
+  const initialized = await proxy.request('initialize', { protocolVersion: '2024-11-05', capabilities: {} });
+  assert.ok(initialized.result);
+  assert.equal(host.state().config.resourceLimits?.maxMessageBytes || 1048576, 1048576);
+});
+
+test('Guard Antigravity command imports the chosen raw config with matching dashboard settings', async t => {
+  const host = extensionHost(await freePort());
+  t.after(() => host.deactivate());
+  const config = path.join(host.storage, 'mcp_config.json');
+  fs.writeFileSync(config, JSON.stringify({ mcpServers: { external: { serverUrl: 'https://example.test/mcp' } } }));
+  host.inputQueue.push(config);
+  await host.runCommand('mcp-guardian.guardAntigravityServers');
+  assert.equal(host.errors.length, 0, host.errors.join('\n'));
+  const imported = JSON.parse(fs.readFileSync(config, 'utf8')).mcpServers;
+  assert.deepEqual(Object.keys(imported), ['agent-guardian']);
+  assert.equal(imported['agent-guardian'].command, 'node', 'An extension host executable is Electron, not node');
+  assert.equal(imported['agent-guardian'].env.MCP_GUARDIAN_WS_PORT, host.env.MCP_GUARDIAN_WS_PORT);
+  assert.equal(host.state().config.servers.find(server => server.name === 'external').url, 'https://example.test/mcp');
 });
 
 test('remote HTTP tool call completes through Guardian and the extension approval channel', async t => {

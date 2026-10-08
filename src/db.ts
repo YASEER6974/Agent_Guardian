@@ -123,10 +123,21 @@ export class GuardianDb {
     this.save();
   }
 
+  applyDiscovery(serverName: string, baselines: Record<string, ToolBaseline>, logs: AuditLog[]): void {
+    // One bounded commit per discovery, rather than rewriting a multi-megabyte
+    // provider database once for every tool. Preserve unrelated latest records.
+    this.refresh();
+    this.data.baselines[serverName] = { ...(this.data.baselines[serverName] || {}), ...baselines };
+    for (const log of logs) this.upsertLog(log);
+    this.save();
+  }
+
   approveDrift(serverName: string, toolName: string, newHash: string): boolean {
     this.refresh();
     const baseline = this.getToolBaseline(serverName, toolName);
-    if (baseline?.observedHash && baseline.observedDefinition && baseline.observedHash === newHash) {
+    if (baseline?.observedHash && baseline.observedDefinition && baseline.observedHash === newHash &&
+      ['drifted', 'pending'].includes(baseline.status || '') && baseline.inspection?.complete === true &&
+      !(baseline.evidence || []).length) {
       baseline.hash = baseline.observedHash;
       baseline.description = baseline.observedDefinition.description;
       baseline.inputSchema = baseline.observedDefinition.inputSchema;

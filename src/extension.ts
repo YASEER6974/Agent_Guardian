@@ -6,7 +6,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { GuardianDb } from './db';
 import { readWorkspaceSettings } from './workspace-settings';
 import { validateServer } from './server-config';
-import { routeWorkspaceServers, saveExternalServer } from './connection-config';
+import { routeAntigravityServers, routeWorkspaceServers, saveExternalServer } from './connection-config';
 import { parse } from 'jsonc-parser/lib/esm/main';
 import { DownstreamServerConfig } from './types';
 import { GuardianConfig, ExtensionMessage, ProxyMessage, AuditLog, ApprovalRequestView } from './types';
@@ -15,6 +15,9 @@ import { CrossSurfaceRecord, CrossSurfaceStore } from './browser/cross-surface-s
 
 let wss: WebSocketServer | null = null;
 let activeProxySocket: WebSocket | null = null;
+const proxySockets = new Set<WebSocket>();
+const approvalOwners = new Map<string, WebSocket>();
+const submittedApprovals = new Set<string>();
 let db: GuardianDb;
 let crossSurfaceStore: CrossSurfaceStore;
 let webviewPanel: vscode.WebviewView | null = null;
@@ -69,6 +72,7 @@ export function activate(context: vscode.ExtensionContext) {
   registerGuardianMcpServer(context, storagePath, wsPort);
   context.subscriptions.push(vscode.commands.registerCommand('mcp-guardian.addExternalServer', () => addExternalServer()));
   context.subscriptions.push(vscode.commands.registerCommand('mcp-guardian.guardWorkspaceServers', () => guardWorkspaceServers(context)));
+  context.subscriptions.push(vscode.commands.registerCommand('mcp-guardian.guardAntigravityServers', () => guardAntigravityServers(context)));
 
   // Register Webview Provider
   const provider = new GuardianWebviewProvider(context.extensionUri);
@@ -100,7 +104,11 @@ export function activate(context: vscode.ExtensionContext) {
 }
 
 export function deactivate() {
-  activeProxySocket?.close();
+  for (const socket of proxySockets) socket.close();
+  proxySockets.clear();
+  approvalOwners.clear();
+  submittedApprovals.clear();
+  pendingApprovalViews.clear();
   if (wss) {
     wss.close();
     wss = null;
@@ -164,6 +172,26 @@ async function guardWorkspaceServers(context: vscode.ExtensionContext): Promise<
   } catch (error) { void vscode.window.showErrorMessage(`Agent Guardian: ${error instanceof Error ? error.message : 'Cannot route servers'}`); }
 }
 
+async function guardAntigravityServers(context: vscode.ExtensionContext): Promise<void> {
+  try {
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ||
+      (workspaceSettingsPath ? path.dirname(path.dirname(workspaceSettingsPath)) : undefined);
+    if (!workspaceRoot) throw new Error('Open the Guardian workspace first');
+    const selected = await vscode.window.showOpenDialog({ canSelectMany: false, canSelectFolders: false,
+      title: 'Select Antigravity MCP config (the file opened by View raw config)', filters: { JSON: ['json'] } });
+    if (!selected?.[0]) return;
+    const settingsPath = path.join(workspaceRoot, '.vscode', 'settings.json');
+    const result = routeAntigravityServers(selected[0].fsPath, workspaceRoot, {
+      command: 'node', args: [path.join(context.extensionUri.fsPath, 'dist', 'cli.js'), 'proxy'], cwd: workspaceRoot,
+      env: { MCP_GUARDIAN_STORAGE_PATH: runtimeStoragePath, MCP_GUARDIAN_WS_PORT: String(connectionPort),
+        MCP_GUARDIAN_WORKSPACE_SETTINGS_PATH: settingsPath }
+    }, { 'mcp-guardian.storagePath': runtimeStoragePath, 'mcp-guardian.wsPort': connectionPort });
+    workspaceSettingsPath = settingsPath;
+    syncSettingsFromVscode();
+    void vscode.window.showInformationMessage(`Routed ${result.imported} Antigravity MCP servers through Guardian. Backup: ${result.backup}. Stop direct servers and refresh Antigravity's MCP manager.`);
+  } catch (error) { void vscode.window.showErrorMessage(`Agent Guardian: ${error instanceof Error ? error.message : 'Cannot route Antigravity servers'}`); }
+}
+
 function syncSettingsFromVscode() {
   const config = vscode.workspace.getConfiguration('mcp-guardian');
   const servers = config.get<any[]>('servers') || [];
@@ -196,7 +224,7 @@ function startWebSocketServer(port: number) {
   connectionPort = port;
   connectionError = undefined;
   try {
-    wss = new WebSocketServer({ port, host: '127.0.0.1' });
+    wss = new WebSocketServer({ port, host: '127.0.0.1', maxPayload: 16_777_216 });
     wss.on('listening', () => {
       console.log(`WebSocket server started on ws://127.0.0.1:${port}`);
       syncStateToWebview();
@@ -213,6 +241,7 @@ function startWebSocketServer(port: number) {
     wss.on('connection', (ws) => {
       console.log('Proxy connected to WS server');
       activeProxySocket = ws;
+      proxySockets.add(ws);
       connectionError = undefined;
       syncStateToWebview();
 
@@ -228,7 +257,7 @@ function startWebSocketServer(port: number) {
       ws.on('message', (message) => {
         try {
           const data: ProxyMessage = JSON.parse(message.toString());
-          handleProxyMessage(data);
+          handleProxyMessage(data, ws);
         } catch (e) {
           console.error('Failed to parse message from proxy:', e);
         }
@@ -236,10 +265,18 @@ function startWebSocketServer(port: number) {
 
       ws.on('close', () => {
         console.log('Proxy disconnected');
-        if (activeProxySocket === ws) {
-          activeProxySocket = null;
-          syncStateToWebview();
+        proxySockets.delete(ws);
+        for (const [id, owner] of approvalOwners) {
+          if (owner === ws) {
+            approvalOwners.delete(id);
+            submittedApprovals.delete(id);
+            pendingApprovalViews.delete(id);
+          }
         }
+        if (activeProxySocket === ws) {
+          activeProxySocket = Array.from(proxySockets).find(socket => socket.readyState === WebSocket.OPEN) || null;
+        }
+        syncStateToWebview();
       });
       ws.on('error', (error) => console.error('Proxy connection error:', error));
     });
@@ -249,25 +286,36 @@ function startWebSocketServer(port: number) {
 }
 
 function sendToProxy(msg: ExtensionMessage) {
-  if (activeProxySocket && activeProxySocket.readyState === WebSocket.OPEN) {
-    activeProxySocket.send(JSON.stringify(msg));
-  }
+  for (const socket of proxySockets) if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(msg));
 }
 
-function handleProxyMessage(msg: ProxyMessage) {
+function handleProxyMessage(msg: ProxyMessage, source: WebSocket) {
   switch (msg.type) {
     case 'sync_state':
-      db.mirrorState({ baselines: msg.baselines, logs: msg.logs, config: msg.config });
+      const incomingLogs = msg.logs.filter(log => !approvalOwners.has(log.id) || approvalOwners.get(log.id) === source);
+      for (const existing of db.getLogs()) {
+        if (approvalOwners.has(existing.id) && approvalOwners.get(existing.id) !== source) incomingLogs.push(existing);
+      }
+      db.mirrorState({ baselines: msg.baselines, logs: incomingLogs, config: msg.config });
       for (const [id] of pendingApprovalViews) {
-        if (!msg.logs.some(log => log.id === id && log.status === 'pending')) pendingApprovalViews.delete(id);
+        if (approvalOwners.get(id) === source && msg.logs.some(log => log.id === id && log.status !== 'pending')) {
+          pendingApprovalViews.delete(id);
+          approvalOwners.delete(id);
+          submittedApprovals.delete(id);
+        }
       }
       // Sync to Webview UI
       syncStateToWebview();
       break;
 
     case 'log':
+      if (approvalOwners.has(msg.log.id) && approvalOwners.get(msg.log.id) !== source) return;
       db.mirrorLog(msg.log);
-      if (msg.log.status !== 'pending') pendingApprovalViews.delete(msg.log.id);
+      if (msg.log.status !== 'pending' && approvalOwners.get(msg.log.id) === source) {
+        pendingApprovalViews.delete(msg.log.id);
+        approvalOwners.delete(msg.log.id);
+        submittedApprovals.delete(msg.log.id);
+      }
       syncStateToWebview();
       break;
 
@@ -279,6 +327,8 @@ function handleProxyMessage(msg: ProxyMessage) {
     case 'approve_request': {
       // Intercepted tool call. Show interactive notification alert
       const approval = msg.approval;
+      if (approvalOwners.has(approval.id) && approvalOwners.get(approval.id) !== source) return;
+      approvalOwners.set(approval.id, source);
       pendingApprovalViews.set(approval.id, approval);
       
       // Update UI first
@@ -302,38 +352,19 @@ function handleProxyMessage(msg: ProxyMessage) {
 }
 
 function respondToPendingRequest(logId: string, approved: boolean, suppliedFingerprint?: string) {
-  // Update local log status
-  const logs = db.getLogs();
-  const logIndex = logs.findIndex(l => l.id === logId);
-  const log = logIndex === -1 ? undefined : logs[logIndex];
-  const fingerprint = suppliedFingerprint || log?.approval?.actionFingerprint;
-  if (!log || !fingerprint || log.status !== 'pending') return;
-  if (log.approval && Date.parse(log.approval.expiresAt) <= Date.now()) {
-    log.status = 'block';
-    log.reason = 'Blocked: approval request expired';
-    log.approval.userResponse = 'expired';
-    db.mirrorLog(log);
-    pendingApprovalViews.delete(logId);
-    syncStateToWebview();
-    return;
-  }
-  {
-    log.status = approved ? 'allow' : 'block';
-    if (!approved) {
-      log.reason = 'Blocked by user decision.';
-    }
-    if (log.approval) log.approval.userResponse = approved ? 'approve_once' : 'deny';
-    db.mirrorLog(log);
-  }
-
-  // Reply to proxy
-  sendToProxy({
+  const approval = pendingApprovalViews.get(logId);
+  const owner = approvalOwners.get(logId);
+  if (!approval || !owner || owner.readyState !== WebSocket.OPEN || submittedApprovals.has(logId)) return;
+  const fingerprint = suppliedFingerprint || approval.actionFingerprint;
+  if (fingerprint !== approval.actionFingerprint || Date.parse(approval.expiresAt) <= Date.now()) return;
+  submittedApprovals.add(logId);
+  // The owning proxy validates action/expiry. Never display optimistic ALLOW.
+  owner.send(JSON.stringify({
     type: 'approve_response',
     id: logId,
     actionFingerprint: fingerprint,
     approved
-  });
-  pendingApprovalViews.delete(logId);
+  } satisfies ExtensionMessage));
 
   // Sync updated state to Webview
   syncStateToWebview();
@@ -366,6 +397,7 @@ function syncStateToWebview() {
       traceIntegrity,
       pendingApprovals: Array.from(pendingApprovalViews.values())
         .filter(item => Date.parse(item.expiresAt) > Date.now())
+        .map(item => ({ ...item, decisionSubmitted: submittedApprovals.has(item.id) }))
     });
   }
 }
@@ -399,6 +431,9 @@ class GuardianWebviewProvider implements vscode.WebviewViewProvider {
           break;
         case 'guard_workspace_servers':
           void vscode.commands.executeCommand('mcp-guardian.guardWorkspaceServers');
+          break;
+        case 'guard_antigravity_servers':
+          void vscode.commands.executeCommand('mcp-guardian.guardAntigravityServers');
           break;
         case 'approve_request':
           respondToPendingRequest(message.id, true, message.actionFingerprint);

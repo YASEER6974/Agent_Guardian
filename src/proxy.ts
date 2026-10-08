@@ -36,7 +36,7 @@ import {
   ProxyMessage,
   ResourceLimits
 } from './types';
-import type { SessionPolicy } from './types';
+import type { SessionPolicy, ToolBaseline } from './types';
 
 type JsonRpcId = string | number | null;
 
@@ -76,7 +76,7 @@ const DEFAULT_LIMITS: ResourceLimits = {
   maxMessageBytes: 1_048_576,
   maxNestingDepth: 64,
   requestTimeoutMs: Number(process.env.MCP_GUARDIAN_REQUEST_TIMEOUT_MS) || 10_000,
-  approvalTimeoutMs: Number(process.env.MCP_GUARDIAN_APPROVAL_TIMEOUT_MS) || 20_000,
+  approvalTimeoutMs: Number(process.env.MCP_GUARDIAN_APPROVAL_TIMEOUT_MS) || 120_000,
   maxScanStrings: 2_000,
   maxDiffEntries: 100
 };
@@ -215,7 +215,12 @@ function connectToExtension(): void {
 function sendToExtension(message: ProxyMessage): void {
   if (!ws || !wsConnected || ws.readyState !== WebSocket.OPEN) return;
   const serialized = JSON.stringify(message);
-  if (Buffer.byteLength(serialized, 'utf8') <= limits().maxMessageBytes) ws.send(serialized);
+  // Aggregated dashboard state contains both trusted and observed definitions
+  // for hundreds of tools. Its local IPC budget is separate from the external
+  // MCP message limit; do not silently drop a real provider's dashboard snapshot.
+  const budget = message.type === 'sync_state' ? 16_777_216 : limits().maxMessageBytes;
+  if (Buffer.byteLength(serialized, 'utf8') <= budget) ws.send(serialized);
+  else console.error(`[MCP-Guardian-Proxy] Dashboard ${message.type} exceeds its bounded IPC budget (${budget} bytes)`);
 }
 
 function handleExtensionMessage(message: ExtensionMessage): void {
@@ -723,6 +728,8 @@ async function listDownstreamTools(serverName: string, params: any = {}): Promis
 function registerTools(serverName: string, tools: any[], output: any[]): void {
   const serverConfig = downstreams.get(serverName)?.config;
   if (!serverConfig) return;
+  const discoveredBaselines: Record<string, ToolBaseline> = {};
+  const discoveryLogs: AuditLog[] = [];
   for (const tool of tools) {
     const prefixedName = `${serverName}__${tool.name}`;
     toolsMapping.set(prefixedName, { serverName, originalName: tool.name });
@@ -753,7 +760,7 @@ function registerTools(serverName: string, tools: any[], output: any[]): void {
         : approved
           ? 'approved'
           : 'pending';
-      db.setToolBaseline(serverName, tool.name, {
+      discoveredBaselines[tool.name] = {
         name: tool.name,
         description: tool.description || '',
         inputSchema: tool.inputSchema || {},
@@ -769,7 +776,7 @@ function registerTools(serverName: string, tools: any[], output: any[]): void {
         differences: [],
         inspection: onboarding.inspection,
         evidence: onboarding.evidence
-      });
+      };
       if (!approved) {
         statusText = status === 'rejected' ? 'REJECTED' : 'PENDING';
         reasons.push(status === 'rejected'
@@ -799,16 +806,16 @@ function registerTools(serverName: string, tools: any[], output: any[]): void {
       baseline.inspection = onboarding.inspection;
       baseline.evidence = onboarding.evidence;
       baseline.lastSeen = new Date().toISOString();
-      db.setToolBaseline(serverName, tool.name, baseline);
+      discoveredBaselines[tool.name] = baseline;
     }
 
     for (const finding of onboarding.evidence) reasons.push(finding.message);
 
     // Never expose a rejected or changed definition to the agent's context.
-    if (onboarding.safe && !isDrift && !['rejected', 'drifted'].includes(db.getToolBaseline(serverName, tool.name)?.status || '')) {
+    if (onboarding.safe && !isDrift && !['rejected', 'drifted'].includes(discoveredBaselines[tool.name]?.status || '')) {
       output.push({ ...tool, name: prefixedName, description: `[MCP-Guardian: ${statusText}] ${tool.description || ''}` });
     }
-    const stored = db.getToolBaseline(serverName, tool.name);
+    const stored = discoveredBaselines[tool.name];
     if (isDrift || onboarding.evidence.length > 0 || !stored?.approved) {
       const auditLog: AuditLog = {
         id: crypto.randomUUID(),
@@ -824,9 +831,11 @@ function registerTools(serverName: string, tools: any[], output: any[]): void {
         evidence: onboarding.evidence,
         inspection: onboarding.inspection
       };
-      persistLog(auditLog);
+      discoveryLogs.push(auditLog);
     }
   }
+  db.applyDiscovery(serverName, discoveredBaselines, discoveryLogs);
+  for (const log of discoveryLogs) sendToExtension({ type: 'log', log });
 }
 
 function applyShadowingRules(): void {
@@ -869,18 +878,20 @@ async function handleToolCall(message: any): Promise<void> {
     return;
   }
 
-  if (downstreams.get(mapping.serverName)?.http) {
+  // Recheck every transport, including stdio bridges to hosted MCPs. A local
+  // launcher does not mean its tool definitions cannot change remotely.
+  {
     try {
       const refreshed = await listDownstreamTools(mapping.serverName);
-      if (refreshed.error) throw new Error('Remote MCP rejected metadata refresh');
+      if (refreshed.error) throw new Error('MCP server rejected metadata refresh');
       registerTools(mapping.serverName, refreshed.result.tools, []);
       applyShadowingRules();
       sendState();
       if (!refreshed.result.tools.some((tool: any) => tool.name === mapping.originalName)) {
-        throw new Error('Remote tool disappeared; restart discovery before calling it');
+        throw new Error('Tool disappeared; restart discovery before calling it');
       }
     } catch (error) {
-      writeError(message.id ?? null, -32603, `Remote tool metadata could not be verified: ${error instanceof Error ? error.message : 'refresh failed'}`);
+      writeError(message.id ?? null, -32603, `Tool metadata could not be verified: ${error instanceof Error ? error.message : 'refresh failed'}`);
       return;
     }
   }

@@ -22,6 +22,10 @@ For remote servers, rejected descriptions are withheld and definitions are check
 
 The client must connect through Guardian; direct global entries, private IDE tools and other clients are not automatically intercepted. The 15-day scheduled recheck remains separate future work.
 
+See [MCP completion and the Vercel demo test](docs/mcp-completion-and-vercel-test.md) for definition review, backed-up Antigravity routing and a safely scoped external deployment test. Metadata is rechecked before calls on both stdio and HTTP transports, including local bridges to remote servers.
+
+The reusable hosted test website has its own repository: [agent-guardian-test-website](https://github.com/YASEER6974/agent-guardian-test-website). Website files are kept separate from this agent repository.
+
 ## Research Goal
 
 Agent Guardian investigates this question:

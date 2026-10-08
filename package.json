@@ -71,6 +71,7 @@
       { "command": "mcp-guardian.refreshDashboard", "title": "MCP Guardian: Refresh Dashboard" },
       { "command": "mcp-guardian.addExternalServer", "title": "MCP Guardian: Add External MCP Server" },
       { "command": "mcp-guardian.guardWorkspaceServers", "title": "MCP Guardian: Guard Workspace MCP Servers" },
+      { "command": "mcp-guardian.guardAntigravityServers", "title": "MCP Guardian: Guard Antigravity MCP Servers" },
       {
         "command": "mcp-guardian.openDashboard",
         "title": "MCP Guardian: Open Dashboard"

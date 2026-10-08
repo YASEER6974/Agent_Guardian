@@ -4,6 +4,48 @@ const { pathToFileURL } = require('node:url');
 const test = require('node:test');
 const { chromium } = require('playwright');
 
+test('definition review shows exact changes, requires review and treats metadata as text', { timeout: 20000 }, async t => {
+  const browser = await chromium.launch({ headless: true });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 420, height: 900 } });
+  await page.addInitScript(() => {
+    globalThis.sent = [];
+    globalThis.acquireVsCodeApi = () => ({ postMessage(message) { sent.push(message); }, getState() {}, setState() {} });
+  });
+  await page.goto(pathToFileURL(path.join(__dirname, '..', 'src/webview/sidebar.html')).href);
+  const baseline = { name: 'search', description: 'Old description', hash: 'a'.repeat(64), category: 'READ_NETWORK',
+    approved: false, status: 'drifted', observedHash: 'b'.repeat(64), inspection: { complete: true }, evidence: [],
+    observedDefinition: { description: '<img src=x onerror="window.injected=true">New description' },
+    differences: [{ path: '$.description', kind: 'changed', before: 'Old description', after: 'New description' }] };
+  const state = { type: 'sync', proxyConnected: true, config: { servers: [], sessionPolicy: {} },
+    baselines: { remote: { "search' onclick='bad": baseline } }, logs: [], pendingApprovals: [], crossSurfaceRecords: [], traceIntegrity: true };
+  await page.evaluate(message => window.dispatchEvent(new MessageEvent('message', { data: message })), state);
+  await page.evaluate(() => switchTab('rules', document.querySelectorAll('.tab-btn')[1]));
+  await page.locator('.definition-review > summary').click();
+  const rules = await page.locator('#rules-container').textContent();
+  assert.match(rules, /Old description/);
+  assert.match(rules, /New description/);
+  assert.match(rules, /\$\.description/);
+  assert.equal(await page.locator('#rules-container img').count(), 0);
+  assert.equal(await page.locator('.accept-definition').isDisabled(), true);
+  await page.locator('.review-definition').check();
+  await page.locator('.accept-definition').click();
+  const approved = await page.evaluate(() => sent.find(item => item.type === 'approve_drift'));
+  assert.equal(approved.toolName, "search' onclick='bad");
+  assert.equal(approved.newHash, 'b'.repeat(64));
+  baseline.status = 'rejected';
+  baseline.evidence = [{ ruleId: 'R2', message: 'Injection detected' }];
+  await page.evaluate(message => window.dispatchEvent(new MessageEvent('message', { data: message })), state);
+  assert.equal(await page.locator('.accept-definition').count(), 0);
+  assert.match(await page.locator('#rules-container').textContent(), /Injection detected/);
+  baseline.status = 'pending';
+  baseline.evidence = [];
+  baseline.inspection.complete = false;
+  await page.evaluate(message => window.dispatchEvent(new MessageEvent('message', { data: message })), state);
+  assert.equal(await page.locator('.accept-definition').count(), 0);
+  assert.doesNotMatch(await page.locator('#rules-container').textContent(), /Metadata changed/);
+});
+
 test('dashboard renders fresh remote metadata, intent, counters and completed approval state', { timeout: 20000 }, async t => {
   const browser = await chromium.launch({ headless: true });
   t.after(() => browser.close());

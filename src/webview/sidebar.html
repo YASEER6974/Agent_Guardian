@@ -32,6 +32,12 @@
       overflow-x: hidden;
     }
 
+    .definition-review { margin-top: 10px; overflow-wrap: anywhere; }
+    .definition-review pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 200px; overflow-y: auto; padding: 8px; background: var(--card-bg); }
+    .definition-difference { margin: 8px 0; }
+    .accept-definition { margin-top: 10px; }
+    .accept-definition:disabled { opacity: 0.45; cursor: not-allowed; }
+
     h1, h2, h3 {
       font-weight: 600;
       margin: 0;
@@ -578,6 +584,7 @@
     <div style="display: flex; gap: 8px; margin-bottom: 12px;">
       <button class="btn btn-secondary" onclick="vscode.postMessage({type: 'add_external_server'})">Add External MCP</button>
       <button class="btn btn-secondary" onclick="vscode.postMessage({type: 'guard_workspace_servers'})">Guard Workspace MCPs</button>
+      <button class="btn btn-secondary" onclick="vscode.postMessage({type: 'guard_antigravity_servers'})">Guard Antigravity MCPs</button>
     </div>
     <div style="color: var(--text-muted); margin-bottom: 12px;">AI agent → Agent Guardian → external MCP server. Add remote HTTP URLs or local server commands here.</div>
     <div class="section-title">
@@ -672,6 +679,65 @@
       vscode.postMessage({ type: 'approve_drift', serverName, toolName, newHash });
     }
 
+    // Tool metadata is untrusted. Use escaped data attributes and delegated
+    // handlers rather than interpolating remote names into JavaScript.
+    const rulesElement = document.getElementById('rules-container');
+    rulesElement.addEventListener('change', event => {
+      const target = event.target;
+      const card = target.closest('.tool-rule-card');
+      if (!card) return;
+      if (target.matches('.category-select')) setCategory(card.dataset.server, card.dataset.tool, target.value);
+      if (target.matches('.review-definition')) {
+        const button = card.querySelector('.accept-definition');
+        if (button) button.disabled = !target.checked;
+      }
+    });
+    rulesElement.addEventListener('click', event => {
+      const button = event.target.closest('.accept-definition');
+      if (!button || button.disabled) return;
+      const card = button.closest('.tool-rule-card');
+      const baseline = currentState.baselines[card.dataset.server]?.[card.dataset.tool];
+      if (!baseline || !canAcceptDefinition(baseline) || !card.querySelector('.review-definition')?.checked) return;
+      approveDrift(card.dataset.server, card.dataset.tool, baseline.observedHash);
+    });
+
+    function canAcceptDefinition(baseline) {
+      return !baseline.approved && ['drifted', 'pending'].includes(baseline.status) &&
+        !!baseline.observedHash && !!baseline.observedDefinition && baseline.inspection?.complete === true &&
+        !(baseline.evidence || []).length;
+    }
+
+    function renderDefinitionReview(baseline) {
+      const status = baseline.status || (baseline.approved ? 'approved' : 'pending');
+      if (baseline.approved) return '<div style="color:var(--success-color)">Approved definition — checked on discovery and before remote calls.</div>';
+      const label = status === 'drifted' ? 'Metadata changed — review required (R1)' :
+        status === 'rejected' ? 'Definition rejected by security inspection' : 'First-seen definition — approval required';
+      const differences = (baseline.differences || []).map(diff => `
+        <details class="definition-difference"><summary>${escapeHtml(diff.path)} — ${escapeHtml(diff.kind)}</summary>
+          <strong>Before</strong><pre>${escapeHtml(JSON.stringify(diff.before, null, 2) ?? '(absent)')}</pre>
+          <strong>After</strong><pre>${escapeHtml(JSON.stringify(diff.after, null, 2) ?? '(absent)')}</pre>
+        </details>`).join('');
+      const findings = (baseline.evidence || []).map(item => `<li>${escapeHtml(item.ruleId || item.detectorId)}: ${escapeHtml(item.message)}</li>`).join('');
+      return `<div class="hash-drift-alert" style="display:block">
+        <div>${label}</div>
+        <p>A change is not proof of an attack. The tool stays restricted until reviewed.</p>
+        <details class="definition-review"><summary>Review saved and observed definitions</summary>
+          <strong>Saved description</strong><pre>${escapeHtml(baseline.description)}</pre>
+          <strong>Observed description</strong><pre>${escapeHtml(baseline.observedDefinition?.description || '(not available)')}</pre>
+          <div>Saved SHA-256: ${escapeHtml(baseline.hash)}</div>
+          <div>Observed SHA-256: ${escapeHtml(baseline.observedHash || '(not available)')}</div>
+          <div>Last inspected: ${escapeHtml(baseline.lastSeen || '(unknown)')}</div>
+          <div>Inspection: ${baseline.inspection?.complete === true ? 'complete' : 'incomplete / unavailable'}</div>
+          ${differences || '<p>No field differences recorded.</p>'}
+          ${findings ? `<ul>${findings}</ul>` : '<p>No scan findings recorded; this is not a guarantee of safety.</p>'}
+          ${canAcceptDefinition(baseline) ? `
+            <label><input type="checkbox" class="review-definition"> I reviewed and accept this exact observed definition.</label>
+            <button type="button" class="btn btn-secondary accept-definition" disabled>${status === 'pending' ? 'Approve Definition' : 'Re-Baseline'}</button>
+          ` : '<p>Acceptance unavailable: rejected or incomplete inspections cannot be bypassed here.</p>'}
+        </details>
+      </div>`;
+    }
+
     function setCategory(serverName, toolName, category) {
       vscode.postMessage({ type: 'set_category', serverName, toolName, category });
     }
@@ -760,8 +826,8 @@
             <div style="font-size: 11px; margin-bottom: 3px; color: var(--text-muted);">Arguments:</div>
             <pre class="alert-details">${escapeHtml(JSON.stringify(alert.arguments, null, 2))}</pre>
             <div class="alert-actions">
-              <button class="btn btn-approve" onclick="approveRequest('${alert.id}', '${alert.actionFingerprint}')">Approve Once</button>
-              <button class="btn btn-deny" onclick="denyRequest('${alert.id}', '${alert.actionFingerprint}')">Deny</button>
+              <button class="btn btn-approve" ${alert.decisionSubmitted ? 'disabled' : ''} onclick="approveRequest('${alert.id}', '${alert.actionFingerprint}')">${alert.decisionSubmitted ? 'Waiting for proxy confirmation…' : 'Approve Once'}</button>
+              <button class="btn btn-deny" ${alert.decisionSubmitted ? 'disabled' : ''} onclick="denyRequest('${alert.id}', '${alert.actionFingerprint}')">Deny</button>
             </div>
           </div>
         `).join('');
@@ -825,10 +891,10 @@
           // (We compute drift check dynamically. When proxy registers drift, the baseline.approved becomes false)
           
           baselinesHTML += `
-            <div class="tool-rule-card">
+            <div class="tool-rule-card" data-server="${escapeHtml(serverName)}" data-tool="${escapeHtml(toolName)}">
               <div class="tool-name-container">
-                <div class="tool-rule-name">${prefixedName}</div>
-                <select class="category-select" onchange="setCategory('${serverName}', '${toolName}', this.value)">
+                <div class="tool-rule-name">${escapeHtml(prefixedName)}</div>
+                <select class="category-select">
                   <option value="GENERAL" ${baseline.category === 'GENERAL' ? 'selected' : ''}>GENERAL</option>
                   <option value="READ_LOCAL" ${baseline.category === 'READ_LOCAL' ? 'selected' : ''}>READ_LOCAL</option>
                   <option value="WRITE_LOCAL" ${baseline.category === 'WRITE_LOCAL' ? 'selected' : ''}>WRITE_LOCAL</option>
@@ -844,13 +910,7 @@
               <div style="font-family: monospace; font-size: 10px; color: #64748b;">
                 SHA-256: ${baseline.hash.substring(0, 16)}...
               </div>
-              ${!baseline.approved ? `
-                <div class="hash-drift-alert">
-                  <div>Metadata drift detected! Baseline mismatched.</div>
-                  <button class="btn btn-secondary" style="padding: 2px 6px; font-size: 10px; flex: none;" 
-                    onclick="approveDrift('${serverName}', '${toolName}', '${baseline.observedHash || baseline.hash}')">Re-Baseline</button>
-                </div>
-              ` : ''}
+              ${renderDefinitionReview(baseline)}
             </div>
           `;
         }

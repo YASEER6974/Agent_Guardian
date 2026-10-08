@@ -126,11 +126,21 @@ test('re-baselining only promotes the exact currently observed definition hash',
     lastSeen: new Date().toISOString(),
     trustedDefinition: trusted,
     observedDefinition: observed,
-    observedHash
+    observedHash,
+    inspection: { complete: true },
+    evidence: []
   });
 
   assert.equal(database.approveDrift('server', 'read', 'wrong-hash'), false);
   assert.equal(database.getToolBaseline('server', 'read').hash, trustedHash);
+  const incomplete = database.getToolBaseline('server', 'read');
+  database.setToolBaseline('server', 'read', { ...incomplete, inspection: { complete: false } });
+  assert.equal(database.approveDrift('server', 'read', observedHash), false);
+  database.setToolBaseline('server', 'read', { ...incomplete, inspection: { complete: true }, evidence: [evidence()] });
+  assert.equal(database.approveDrift('server', 'read', observedHash), false);
+  database.setToolBaseline('server', 'read', { ...incomplete, inspection: { complete: true }, evidence: [], status: 'rejected' });
+  assert.equal(database.approveDrift('server', 'read', observedHash), false);
+  database.setToolBaseline('server', 'read', { ...incomplete, inspection: { complete: true }, evidence: [], status: 'drifted' });
   assert.equal(database.approveDrift('server', 'read', observedHash), true);
   const promoted = database.getToolBaseline('server', 'read');
   assert.equal(promoted.hash, observedHash);

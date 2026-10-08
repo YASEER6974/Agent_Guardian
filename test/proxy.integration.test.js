@@ -105,6 +105,32 @@ function mockServer(name, mode = 'normal', env = {}) {
   };
 }
 
+test('stdio tools are re-inspected before calls to catch a rug pull without a notification', { concurrency: false }, async t => {
+  const proxy = await startProxy(configFor([mockServer('bridge', 'rug-pull-after-discovery')]));
+  t.after(() => proxy.stop());
+  await proxy.request(1, 'initialize', { protocolVersion: '2024-11-05', capabilities: {} });
+  const listed = await proxy.request(2, 'tools/list');
+  assert.ok(listed.result.tools.some(tool => tool.name === 'bridge__echo'));
+  const called = await proxy.request(3, 'tools/call', { name: 'bridge__echo', arguments: { value: 'harmless' } });
+  assert.ok(called.error, 'Changed metadata must not execute');
+  const database = JSON.parse(fs.readFileSync(path.join(proxy.storagePath, 'mcp-guardian-db.json'), 'utf8'));
+  assert.ok(database.logs.some(log => log.serverName === 'bridge' && log.status === 'block' && log.drift));
+});
+
+test('deployment tools are external writes and cannot execute under a read-only session', { concurrency: false }, async t => {
+  const proxy = await startProxy(configFor([mockServer('vercel-fixture', 'normal', { MOCK_DEPLOY_TOOL: '1' })], {
+    sessionPolicy: { intent: 'Inspect projects only', allowedCapabilities: ['READ_NETWORK'], trustedDestinations: [] }
+  }));
+  t.after(() => proxy.stop());
+  await proxy.request(1, 'initialize', { protocolVersion: '2024-11-05', capabilities: {} });
+  await proxy.request(2, 'tools/list');
+  const result = await proxy.request(3, 'tools/call', { name: 'vercel-fixture__deploy_to_vercel', arguments: { project: 'demo' } });
+  assert.ok(result.error);
+  const database = JSON.parse(fs.readFileSync(path.join(proxy.storagePath, 'mcp-guardian-db.json'), 'utf8'));
+  assert.equal(database.baselines['vercel-fixture'].deploy_to_vercel.category, 'WRITE_COMMUNICATION');
+  assert.ok(database.logs.some(log => log.toolName === 'deploy_to_vercel' && log.status === 'block'));
+});
+
 test('proxy aggregates multiple servers and preserves arbitrary client ids under concurrent calls', { concurrency: false }, async t => {
   const proxy = await startProxy(configFor([mockServer('alpha'), mockServer('beta')]));
   t.after(() => proxy.stop());

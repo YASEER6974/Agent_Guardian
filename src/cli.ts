@@ -4,7 +4,8 @@ import * as path from 'path';
 import { GuardianDb } from './db';
 import { validateServer } from './server-config';
 import { readWorkspaceSettings } from './workspace-settings';
-import { applyEdits, modify } from 'jsonc-parser/lib/esm/main';
+import { routeAntigravityServers } from './connection-config';
+import { applyEdits, modify, parse, ParseError } from 'jsonc-parser/lib/esm/main';
 import { parseAuditExport, ReportFormat, serializeReport, verifyAuditExport } from './reporting';
 
 export const EXIT_OK = 0;
@@ -27,6 +28,7 @@ function main(args = process.argv.slice(2)): number {
     }
     if (command === 'config') {
       if (operation === 'add-server') return addServer(args.slice(2));
+      if (operation === 'guard-antigravity') return guardAntigravity(args.slice(2));
       if (operation === 'show') return showConfig(args.slice(2));
       return usage(`Unknown config operation '${operation || ''}'`);
     }
@@ -38,6 +40,27 @@ function main(args = process.argv.slice(2)): number {
     process.stderr.write(`Agent Guardian: ${error instanceof Error ? error.message : String(error)}\n`);
     return EXIT_IO;
   }
+}
+
+function guardAntigravity(args: string[]): number {
+  const configFile = option(args, '--config');
+  const workspace = option(args, '--workspace');
+  if (!configFile || !workspace) return usage('guard-antigravity requires --config <raw-config-file> and --workspace <project-folder>');
+  const root = path.resolve(workspace);
+  if (!fs.statSync(root).isDirectory()) return usage('--workspace must be a directory');
+  const settingsPath = path.join(root, '.vscode', 'settings.json');
+  const errors: ParseError[] = [];
+  const settings = fs.existsSync(settingsPath) ? parse(fs.readFileSync(settingsPath, 'utf8'), errors, { allowTrailingComma: true }) : {};
+  if (errors.length || !settings || typeof settings !== 'object') return usage('Invalid workspace settings');
+  const storage = path.resolve(option(args, '--storage') || settings['mcp-guardian.storagePath'] || path.join(root, '.mcp-guardian', 'runtime'));
+  const port = Number(option(args, '--port') || settings['mcp-guardian.wsPort'] || 1337);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return usage('Invalid --port');
+  const result = routeAntigravityServers(path.resolve(configFile), root, {
+    command: process.execPath, args: [path.join(__dirname, 'cli.js'), 'proxy'], cwd: root,
+    env: { MCP_GUARDIAN_STORAGE_PATH: storage, MCP_GUARDIAN_WS_PORT: String(port), MCP_GUARDIAN_WORKSPACE_SETTINGS_PATH: settingsPath }
+  }, { 'mcp-guardian.storagePath': storage, 'mcp-guardian.wsPort': port });
+  process.stdout.write(`Routed ${result.imported} external MCP servers through Guardian.\nBackup: ${result.backup || '(new config)'}\nDashboard port: ${port}\nReload the matching Guardian extension host and refresh Antigravity MCP servers; stop old direct connections.\n`);
+  return EXIT_OK;
 }
 
 function addServer(args: string[]): number {
@@ -124,6 +147,7 @@ function help(): string {
     '  agent-guardian config add-server --name <name> --command <command> [--args-json <json>] [--storage <directory>]',
     '  agent-guardian config add-server --name <name> --url <http-mcp-url> [--headers-json <json>] [--storage <directory>] [--workspace-settings <file>]',
     '  agent-guardian config show [--storage <directory>]',
+    '  agent-guardian config guard-antigravity --config <raw-config-file> --workspace <project-folder> [--port <number>] [--storage <directory>]',
     '  agent-guardian report export --format json|jsonl|sarif --out <file> [--storage <directory>]',
     '  agent-guardian report verify --input <json-or-jsonl-file>',
     '',
