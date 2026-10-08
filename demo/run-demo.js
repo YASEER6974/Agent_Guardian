@@ -58,8 +58,8 @@ async function main() {
     report.traceRecords = store.list();
     report.traceIntegrity = true; // list() verifies every hash before returning.
     report.assertions = {
-      maliciousCredentialHeld: malicious.credentialDecision === 'ASK',
-      maliciousExternalSendHeld: malicious.sendDecision === 'ASK',
+      maliciousCredentialHeld: ['ASK', 'BLOCK'].includes(malicious.credentialDecision),
+      maliciousExternalSendHeld: ['ASK', 'BLOCK'].includes(malicious.sendDecision),
       maliciousSideEffectPrevented: counters.attackerDeliveries === 0,
       benignSendAllowed: benign.sendDecision === 'ALLOW',
       benignSideEffectCompleted: counters.approvedDeliveries === 1

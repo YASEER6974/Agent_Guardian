@@ -26,6 +26,7 @@ let connectionPort = 1337;
 let connectionError: string | undefined;
 let workspaceSettingsPath: string | undefined;
 let runtimeStoragePath: string;
+let stopBrowserTraceWatch: (() => void) | undefined;
 
 export function activate(context: vscode.ExtensionContext) {
   console.log('MCP Guardian is active.');
@@ -45,6 +46,11 @@ export function activate(context: vscode.ExtensionContext) {
   runtimeStoragePath = storagePath;
   db = new GuardianDb(storagePath);
   crossSurfaceStore = new CrossSurfaceStore(storagePath);
+  const browserTracePath = path.join(storagePath, 'cross-surface-events.jsonl');
+  const updateBrowserTrace = () => syncStateToWebview();
+  fs.watchFile(browserTracePath, { interval: 1_000, persistent: false }, updateBrowserTrace);
+  stopBrowserTraceWatch = () => fs.unwatchFile(browserTracePath, updateBrowserTrace);
+  context.subscriptions.push({ dispose: stopBrowserTraceWatch });
 
   // Sync extension config with VS Code settings
   syncSettingsFromVscode();
@@ -104,6 +110,8 @@ export function activate(context: vscode.ExtensionContext) {
 }
 
 export function deactivate() {
+  stopBrowserTraceWatch?.();
+  stopBrowserTraceWatch = undefined;
   for (const socket of proxySockets) socket.close();
   proxySockets.clear();
   approvalOwners.clear();

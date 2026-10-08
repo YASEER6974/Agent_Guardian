@@ -1,7 +1,7 @@
 import * as crypto from 'crypto';
 import { Decision, DecisionOutcome, Evidence, GuardianSession, PolicyOptions, SecurityEvent } from './types';
 
-const BLOCK_RULES = new Set(['R1', 'R5', 'R7']);
+const BLOCK_RULES = new Set(['R1', 'R5', 'R7', 'B1', 'B2', 'B3']);
 const ASK_RULES = new Set(['R2', 'R3', 'R4', 'R6', 'R8']);
 
 export class PolicyEngine {

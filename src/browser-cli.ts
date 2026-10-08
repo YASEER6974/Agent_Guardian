@@ -1,6 +1,7 @@
 import * as os from 'os';
 import * as path from 'path';
 import { GuardedBrowserHarness } from './browser/playwright-harness';
+import { browserDecisionReport } from './browser/mcp-service';
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
@@ -24,7 +25,8 @@ async function main(): Promise<void> {
       return;
     }
     const observation = await harness.observe();
-    process.stdout.write(`${JSON.stringify(observation, null, 2)}\n`);
+    process.stdout.write(`${JSON.stringify(observation.decision.outcome === 'ALLOW' ? observation : browserDecisionReport(observation.decision), null, 2)}\n`);
+    if (observation.decision.outcome !== 'ALLOW') process.exitCode = observation.decision.outcome === 'BLOCK' ? 3 : 2;
   } finally {
     await harness.close();
   }

@@ -4,7 +4,7 @@ import * as path from 'path';
 import { GuardianDb } from './db';
 import { validateServer } from './server-config';
 import { readWorkspaceSettings } from './workspace-settings';
-import { routeAntigravityServers } from './connection-config';
+import { routeAntigravityServers, saveExternalServer } from './connection-config';
 import { applyEdits, modify, parse, ParseError } from 'jsonc-parser/lib/esm/main';
 import { parseAuditExport, ReportFormat, serializeReport, verifyAuditExport } from './reporting';
 
@@ -28,6 +28,7 @@ function main(args = process.argv.slice(2)): number {
     }
     if (command === 'config') {
       if (operation === 'add-server') return addServer(args.slice(2));
+      if (operation === 'add-browser') return addBrowser(args.slice(2));
       if (operation === 'guard-antigravity') return guardAntigravity(args.slice(2));
       if (operation === 'show') return showConfig(args.slice(2));
       return usage(`Unknown config operation '${operation || ''}'`);
@@ -40,6 +41,37 @@ function main(args = process.argv.slice(2)): number {
     process.stderr.write(`Agent Guardian: ${error instanceof Error ? error.message : String(error)}\n`);
     return EXIT_IO;
   }
+}
+
+function addBrowser(args: string[]): number {
+  const settingsPath = option(args, '--workspace-settings') || process.env.MCP_GUARDIAN_WORKSPACE_SETTINGS_PATH;
+  if (!settingsPath) return usage('add-browser requires --workspace-settings <file>');
+  const values = (name: string) => args.flatMap((item, index) => item === name ? [args[index + 1]] : []);
+  const normalize = (value: string): string => {
+    const url = new URL(value);
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.pathname !== '/' || url.search || url.hash) {
+      throw new Error('Browser origins must not contain paths, credentials or queries');
+    }
+    return url.origin;
+  };
+  const allowed = values('--allowed-origin').map(normalize);
+  const trusted = values('--trusted-origin').map(normalize);
+  if (!allowed.length || trusted.some(item => !allowed.includes(item))) return usage('Specify allowed origins; trusted origins must be a subset');
+  const file = path.resolve(settingsPath);
+  const raw = parse(fs.readFileSync(file, 'utf8'));
+  const storage = path.resolve(option(args, '--storage') || raw['mcp-guardian.storagePath'] || process.env.MCP_GUARDIAN_STORAGE_PATH || path.join(os.homedir(), '.mcp-guardian'));
+  const settings = readWorkspaceSettings(file, new GuardianDb(storage).getConfig());
+  const browserArgs = [path.join(__dirname, 'browser-mcp.js'), '--storage', storage,
+    ...allowed.flatMap(item => ['--allowed-origin', item]), ...trusted.flatMap(item => ['--trusted-origin', item])];
+  if (args.includes('--allow-forms')) browserArgs.push('--allow-forms');
+  if (args.includes('--headed')) browserArgs.push('--headed');
+  const server = validateServer({ name: 'browser', command: process.execPath, args: browserArgs });
+  const backup = `${file}.guardian-backup-${Date.now()}`;
+  fs.copyFileSync(file, backup, fs.constants.COPYFILE_EXCL);
+  saveExternalServer(file, server);
+  new GuardianDb(storage).updateConfig({ ...settings, servers: [...(settings.servers || []).filter(item => item.name !== 'browser'), server] });
+  process.stdout.write(`Added guarded browser behind Agent Guardian.\nBackup: ${backup}\nRestart agent-guardian in your IDE to discover browser__web_read_page. Existing manual approval and capability settings were preserved.\n`);
+  return EXIT_OK;
 }
 
 function guardAntigravity(args: string[]): number {
@@ -147,6 +179,7 @@ function help(): string {
     '  agent-guardian config add-server --name <name> --command <command> [--args-json <json>] [--storage <directory>]',
     '  agent-guardian config add-server --name <name> --url <http-mcp-url> [--headers-json <json>] [--storage <directory>] [--workspace-settings <file>]',
     '  agent-guardian config show [--storage <directory>]',
+    '  agent-guardian config add-browser --workspace-settings <file> --allowed-origin <origin> [--trusted-origin <origin>] [--allow-forms] [--headed]',
     '  agent-guardian config guard-antigravity --config <raw-config-file> --workspace <project-folder> [--port <number>] [--storage <directory>]',
     '  agent-guardian report export --format json|jsonl|sarif --out <file> [--storage <directory>]',
     '  agent-guardian report verify --input <json-or-jsonl-file>',

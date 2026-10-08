@@ -24,6 +24,12 @@ The client must connect through Guardian; direct global entries, private IDE too
 
 See [MCP completion and the Vercel demo test](docs/mcp-completion-and-vercel-test.md) for definition review, backed-up Antigravity routing and a safely scoped external deployment test. Metadata is rechecked before calls on both stdio and HTTP transports, including local bridges to remote servers.
 
+Browser Guardian now exposes guarded page-reading/link tools behind the same MCP
+proxy. See [the Browser MCP setup and test guide](docs/browser-mcp-guide.md). Run
+`npm run demo:browser-live` to verify the deployed benign page/form and a local
+poisoned twin through the real proxy. This is a constrained, script-disabled
+browser integration—not automatic interception of every IDE browser/search tool.
+
 The reusable hosted test website has its own repository: [agent-guardian-test-website](https://github.com/YASEER6974/agent-guardian-test-website). Website files are kept separate from this agent repository.
 
 ## Research Goal

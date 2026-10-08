@@ -177,7 +177,12 @@ export class EvaluationEngine {
       ...observation.evidence.filter(item =>
         (item.detectorId === 'browser.content' && enabled(configuration, 'semantic')) ||
         (item.detectorId !== 'browser.content' && enabled(configuration, 'provenance'))
-      ),
+      ).map(item => {
+        // This evaluator replays the frozen v1 research policy (ASK on text
+        // suspicion). Live Browser MCP now uses B1/B2 hard content-release gates;
+        // dedicated Chromium/MCP tests verify that newer boundary separately.
+        return item.ruleId === 'B1' ? { ...item, ruleId: 'R6' } : item;
+      }),
       ...action.evidence.filter(item => {
         if (item.detectorId === 'browser.session-policy') return enabled(configuration, 'intent');
         return enabled(configuration, 'provenance');

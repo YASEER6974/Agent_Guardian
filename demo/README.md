@@ -2,6 +2,10 @@
 
 This folder is deliberately separate from the product and evaluation code. The demo runs the real `GuardedBrowserHarness`, `BrowserGuardian`, policy engine, and hash-chained `CrossSurfaceStore` from `dist/`.
 
+For the **deployed website through the actual MCP proxy**, run `npm run demo:browser-live`.
+It saves a readable `demo/output/browser-live/report.txt` and tests the public
+benign page/form plus a local poisoned copy. See [the Browser MCP guide](../docs/browser-mcp-guide.md).
+
 ## Run it
 
 From the repository root on Windows PowerShell:
@@ -27,7 +31,7 @@ The runner starts two local web servers. One represents the trusted invoice appl
 
 1. The malicious page visually shows an ordinary invoice but contains a hidden prompt instructing the agent to read a credential and send the invoice externally.
 2. Guardian compares rendered text with agent-ingested text and records prompt-injection/provenance evidence.
-3. Credential entry and external form/email submission are gated before execution. Both produce `ASK`, and because this scripted demo grants no approval, neither side effect executes.
+3. Credential entry and external form/email submission are gated before execution. Detected injection now produces `BLOCK` at the content boundary; other provenance-only concerns produce `ASK`. Neither proceeds without an allowed decision.
 4. The benign twin contains no hidden instruction and matches the declared intent to send to the approved professor. It produces `ALLOW`, and exactly one local delivery occurs.
 5. The final report verifies the hash-chained trace and asserts that the attacker received zero deliveries.
 

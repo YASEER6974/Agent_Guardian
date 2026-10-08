@@ -112,6 +112,12 @@ async function main() {
     external: ['playwright'],
   });
 
+  const browserMcpCtx = await esbuild.context({
+    entryPoints: ['./src/browser-mcp.ts'], bundle: true, platform: 'node',
+    outfile: './dist/browser-mcp.js', format: 'cjs', sourcemap: true,
+    minify, external: ['playwright'], banner: { js: '#!/usr/bin/env node' }
+  });
+
   const evaluateCliCtx = await esbuild.context({
     entryPoints: ['./src/evaluate-cli.ts'],
     bundle: true,
@@ -135,6 +141,7 @@ async function main() {
     await cliCtx.watch();
     await browserCtx.watch();
     await browserCliCtx.watch();
+    await browserMcpCtx.watch();
     await evaluationCtx.watch();
     await evaluateCliCtx.watch();
   } else {
@@ -147,6 +154,7 @@ async function main() {
     await cliCtx.rebuild();
     await browserCtx.rebuild();
     await browserCliCtx.rebuild();
+    await browserMcpCtx.rebuild();
     await evaluationCtx.rebuild();
     await evaluateCliCtx.rebuild();
     await extensionCtx.dispose();
@@ -158,6 +166,7 @@ async function main() {
     await cliCtx.dispose();
     await browserCtx.dispose();
     await browserCliCtx.dispose();
+    await browserMcpCtx.dispose();
     await evaluationCtx.dispose();
     await evaluateCliCtx.dispose();
     console.log('Build completed successfully.');

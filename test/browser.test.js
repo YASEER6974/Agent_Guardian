@@ -126,7 +126,7 @@ test('Playwright harness observes hidden content and holds the malicious form be
   assert.ok((await attacked.observe()).evidenceCount > 0);
   const before = submissions;
   const decision = await attacked.submit('#send');
-  assert.equal(decision.outcome, 'ASK');
+  assert.equal(decision.outcome, 'BLOCK');
   await new Promise(resolve => setTimeout(resolve, 100));
   assert.equal(submissions, before, 'held action must not reach the server');
 });

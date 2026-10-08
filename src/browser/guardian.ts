@@ -16,10 +16,12 @@ export interface BrowserObservation {
   links?: Array<{ text: string; href: string }>;
   forms?: Array<{ action: string; method: string; fields: string[] }>;
   networkDestinations?: string[];
+  inspectionComplete?: boolean;
 }
 
 export type BrowserActionType =
   | 'navigate'
+  | 'fill'
   | 'submit_form'
   | 'download'
   | 'credential_entry'
@@ -35,29 +37,39 @@ export interface BrowserAction {
   payload?: unknown;
   dataLabels?: DataLabel[];
   capability?: string;
+  denialReason?: string;
 }
 
 export interface BrowserGuardianOptions {
   trustedOrigins?: string[];
   sessionPolicy?: SessionPolicy;
   approvalTtlMs?: number;
+  allowedOrigins?: string[];
 }
 
 export class BrowserGuardian {
   private readonly policyEngine: PolicyEngine;
   private readonly trustedOrigins: Set<string>;
   private readonly sessionPolicy: SessionPolicy;
+  private readonly allowedOrigins?: Set<string>;
 
   constructor(private readonly store: CrossSurfaceStore, options: BrowserGuardianOptions = {}) {
     this.policyEngine = new PolicyEngine({ approvalTtlMs: options.approvalTtlMs });
     this.trustedOrigins = new Set((options.trustedOrigins || []).map(normalizeOrigin));
     this.sessionPolicy = options.sessionPolicy || { intent: '', allowedCapabilities: [], trustedDestinations: [] };
+    this.allowedOrigins = options.allowedOrigins ? new Set(options.allowedOrigins.map(normalizeOrigin)) : undefined;
   }
 
-  observe(observation: BrowserObservation): { event: SecurityEvent; evidence: Evidence[] } {
+  observe(observation: BrowserObservation): { event: SecurityEvent; evidence: Evidence[]; decision: Decision } {
     const eventId = `browser-observation:${crypto.randomUUID()}`;
     const inspection = inspectStructuredText(observation, 'browser.content', eventId);
-    const evidence = [...inspection.evidence];
+    const evidence: Evidence[] = inspection.evidence.map(item => ({
+      ...item, ruleId: item.ruleId || 'B1', provenance: { ...item.provenance, lane: 'browser' }
+    }));
+    if (inspection.truncated || observation.inspectionComplete === false) {
+      evidence.push(makeEvidence('browser.inspection', 'B2', 'high',
+        'Page inspection is incomplete; content is withheld', eventId));
+    }
     const hidden = hiddenAgentSegments(observation.visibleText, observation.agentText);
     if (hidden.length > 0) {
       evidence.push(makeEvidence('browser.visibility', 'R6', 'high',
@@ -86,8 +98,9 @@ export class BrowserGuardian {
         hiddenSegmentCount: hidden.length
       }
     };
-    this.store.append({ event, evidence, fingerprints: fingerprintsFor(observation) });
-    return { event, evidence };
+    const decision = this.policyEngine.evaluate(sessionFor(observation.sessionId, this.sessionPolicy, event, labels), event, evidence);
+    this.store.append({ event, evidence, fingerprints: fingerprintsFor(observation), decision });
+    return { event, evidence, decision };
   }
 
   gate(action: BrowserAction): Decision {
@@ -108,6 +121,15 @@ export class BrowserGuardian {
       input: action.payload
     };
     const evidence: Evidence[] = [];
+    if (action.denialReason) {
+      evidence.push(makeEvidence('browser.boundary', 'B3', 'high', action.denialReason, eventId));
+    }
+    const destinationDenied = Boolean(action.destination && this.allowedOrigins &&
+      (!isWebUrl(action.destination) || !this.allowedOrigins.has(normalizeOrigin(action.destination))));
+    if (destinationDenied) {
+      evidence.push(makeEvidence('browser.destination', 'B3', 'critical',
+        'Destination is outside the operator-configured browser origin allowlist', eventId));
+    }
     const privileged = ['submit_form', 'download', 'credential_entry', 'purchase', 'network_request', 'execute_system'].includes(action.type);
     if (privileged && influence.influenced && influence.labels.includes('untrusted')) {
       evidence.push(makeEvidence('browser.provenance', action.type === 'execute_system' ? 'R7' : 'R6',
@@ -128,6 +150,11 @@ export class BrowserGuardian {
     }
     const session = sessionFor(action.sessionId, this.sessionPolicy, event, labels);
     const decision = this.policyEngine.evaluate(session, event, evidence);
+    if (destinationDenied) {
+      decision.outcome = 'BLOCK';
+      decision.explanation = 'Blocked: destination is outside the operator-configured browser origin allowlist.';
+      delete decision.expiresAt;
+    }
     this.store.append({ event, evidence, fingerprints: fingerprintsFor(action.payload), decision });
     return decision;
   }
@@ -139,6 +166,13 @@ export class BrowserGuardian {
   }
 }
 
+function isWebUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password;
+  } catch { return false; }
+}
+
 function capabilityFor(action: BrowserActionType): string {
   return `BROWSER_${action.toUpperCase()}`;
 }
@@ -146,9 +180,10 @@ function capabilityFor(action: BrowserActionType): string {
 function hiddenAgentSegments(visibleText: string, agentText?: string): string[] {
   if (!agentText) return [];
   const visible = normalizeText(visibleText);
+  const compactVisible = visible.replace(/\s/g, '');
   return agentText.split(/\r?\n/)
     .map(normalizeText)
-    .filter(segment => segment.length >= 8 && !visible.includes(segment));
+    .filter(segment => segment.length >= 8 && !visible.includes(segment) && !compactVisible.includes(segment.replace(/\s/g, '')));
 }
 
 function normalizeText(value: string): string {

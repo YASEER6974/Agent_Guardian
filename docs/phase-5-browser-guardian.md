@@ -2,6 +2,11 @@
 
 Browser Guardian is a controlled Playwright/Chromium research harness. It is not a universal interceptor for arbitrary browser processes. Browser activity is protected when the agent uses this harness, just as MCP activity is protected when the client uses the Guardian proxy.
 
+The agent-facing downstream MCP integration and current live-test evidence are
+documented in [Browser MCP setup](browser-mcp-guide.md). It withholds detected
+injection (B1) and incomplete inspection (B2) before returning text to the agent,
+and refuses unapproved origins / redirects (B3).
+
 ## Protected boundary
 
 The harness captures page origin, title, rendered text, DOM-ingested text, frames, links, forms, and network destinations. It compares rendered text with agent-ingested DOM text so hidden content remains attributable to its page.
@@ -13,7 +18,7 @@ The following operations are checked before their side effect:
 - credential entry;
 - purchases;
 - downloads;
-- non-read network requests, fetches, XHR, and WebSockets;
+- non-read network requests, fetches and XHR; in Browser MCP, origins are scoped for all resources and WebSockets are closed;
 - browser-influenced system execution.
 
 `ALLOW` proceeds, while `ASK` is held unless the embedding application supplies an approval callback. `BLOCK` never proceeds. The default CLI does not auto-approve held actions.

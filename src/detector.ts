@@ -178,6 +178,8 @@ export function checkTransition(
 export function autoAssignCategory(toolName: string, description = ''): string {
   const name = toolName.toLowerCase();
   const desc = description.toLowerCase();
+  if (name === 'fill_field' || name === 'submit_form') return 'WRITE_COMMUNICATION';
+  if (name === 'web_read_page' || name === 'web_follow_link') return 'READ_NETWORK';
 
   const isRead = name.includes('read') || name.includes('get') || name.includes('view') || name.includes('search') || name.includes('list');
   const isWrite = /^(?:write|send|post|create|update|delete|remove|drop|alter|deploy|publish|apply|promote|rollback|edit|patch|buy|upload|assign|replace|cancel|start|stop|approve|complete|pause|unpause|activate|revoke|issue|set|upsert|request_promote|request_rollback)(?:_|$)/.test(name) || /(?:slack|mail)/.test(name);
