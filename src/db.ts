@@ -16,6 +16,19 @@ export class GuardianDb {
     this.data = this.load();
   }
 
+  refresh(): void {
+    this.data = this.load();
+  }
+
+  // Runtime snapshots received by the dashboard are read-only mirrors.
+  mirrorState(state: { baselines: Record<string, Record<string, ToolBaseline>>; logs: AuditLog[]; config: GuardianConfig }): void {
+    this.data = structuredClone(state);
+  }
+
+  mirrorLog(log: AuditLog): void {
+    this.upsertLog(log);
+  }
+
   private ensureDirectoryExists(dir: string) {
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
@@ -71,10 +84,13 @@ export class GuardianDb {
   }
 
   private save(dataToSave = this.data) {
+    const stagingPath = `${this.filePath}.guardian-${process.pid}.tmp`;
     try {
-      fs.writeFileSync(this.filePath, JSON.stringify(dataToSave, null, 2), 'utf-8');
+      fs.writeFileSync(stagingPath, JSON.stringify(dataToSave, null, 2), 'utf-8');
+      fs.renameSync(stagingPath, this.filePath);
     } catch (e) {
       console.error('Failed to write database file', e);
+      if (fs.existsSync(stagingPath)) fs.unlinkSync(stagingPath);
     }
   }
 
@@ -84,6 +100,7 @@ export class GuardianDb {
   }
 
   updateConfig(config: Partial<GuardianConfig>) {
+    this.refresh();
     this.data.config = { ...this.data.config, ...config };
     this.save();
   }
@@ -98,6 +115,7 @@ export class GuardianDb {
   }
 
   setToolBaseline(serverName: string, toolName: string, baseline: ToolBaseline) {
+    this.refresh();
     if (!this.data.baselines[serverName]) {
       this.data.baselines[serverName] = {};
     }
@@ -106,6 +124,7 @@ export class GuardianDb {
   }
 
   approveDrift(serverName: string, toolName: string, newHash: string): boolean {
+    this.refresh();
     const baseline = this.getToolBaseline(serverName, toolName);
     if (baseline?.observedHash && baseline.observedDefinition && baseline.observedHash === newHash) {
       baseline.hash = baseline.observedHash;
@@ -123,6 +142,7 @@ export class GuardianDb {
   }
 
   setToolCategory(serverName: string, toolName: string, category: string) {
+    this.refresh();
     const baseline = this.getToolBaseline(serverName, toolName);
     if (baseline) {
       baseline.category = category;
@@ -136,6 +156,12 @@ export class GuardianDb {
   }
 
   addLog(log: AuditLog) {
+    this.refresh();
+    this.upsertLog(log);
+    this.save();
+  }
+
+  private upsertLog(log: AuditLog) {
     const existingIndex = this.data.logs.findIndex(existing => existing.id === log.id);
     if (existingIndex >= 0) {
       this.data.logs[existingIndex] = { ...this.data.logs[existingIndex], ...log };
@@ -146,10 +172,10 @@ export class GuardianDb {
     if (this.data.logs.length > 500) {
       this.data.logs.pop();
     }
-    this.save();
   }
 
   clearLogs() {
+    this.refresh();
     this.data.logs = [];
     this.save();
   }

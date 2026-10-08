@@ -42,6 +42,12 @@
     "agent-guardian-evaluate": "./dist/evaluate-cli.js"
   },
   "contributes": {
+    "mcpServerDefinitionProviders": [
+      {
+        "id": "mcp-guardian.proxy",
+        "label": "Agent Guardian"
+      }
+    ],
     "viewsContainers": {
       "activitybar": [
         {
@@ -62,6 +68,9 @@
       ]
     },
     "commands": [
+      { "command": "mcp-guardian.refreshDashboard", "title": "MCP Guardian: Refresh Dashboard" },
+      { "command": "mcp-guardian.addExternalServer", "title": "MCP Guardian: Add External MCP Server" },
+      { "command": "mcp-guardian.guardWorkspaceServers", "title": "MCP Guardian: Guard Workspace MCP Servers" },
       {
         "command": "mcp-guardian.openDashboard",
         "title": "MCP Guardian: Open Dashboard"
@@ -96,10 +105,13 @@
           "items": {
             "type": "object",
             "required": [
-              "name",
-              "command"
+              "name"
             ],
+            "anyOf": [ { "required": ["command"] }, { "required": ["url"] } ],
             "properties": {
+              "type": { "type": "string", "enum": ["stdio", "http"], "description": "Downstream MCP transport." },
+              "url": { "type": "string", "description": "Remote Streamable HTTP MCP endpoint." },
+              "headers": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Optional HTTP headers; use ${env:VARIABLE} for authentication." },
               "name": {
                 "type": "string",
                 "description": "Unique identifier for the downstream server."
@@ -108,6 +120,7 @@
                 "type": "string",
                 "description": "Command to run the server (e.g. node, npx, python)."
               },
+              "cwd": { "type": "string", "description": "Working directory for a local MCP server." },
               "args": {
                 "type": "array",
                 "items": {
@@ -226,6 +239,8 @@
     "typescript": "^5.3.3"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "jsonc-parser": "3.3.1",
     "ws": "^8.16.0"
   }
 }

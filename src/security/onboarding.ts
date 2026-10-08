@@ -22,7 +22,8 @@ export function inspectOnboarding(
   const ledger = new CompletenessLedger();
   const configStarted = new Date().toISOString();
   const configInspection = inspectStructuredText(
-    { name: server.name, command: server.command, args: server.args || [], envKeys: Object.keys(server.env || {}) },
+    { name: server.name, type: server.type || (server.url ? 'http' : 'stdio'), url: server.url,
+      command: server.command, args: server.args || [], envKeys: Object.keys(server.env || {}), headerKeys: Object.keys(server.headers || {}) },
     'onboarding.server-config',
     eventId,
     maxStrings

@@ -2,9 +2,13 @@ import type { DataLabel, Evidence, InspectionSummary } from './core/types';
 
 export interface DownstreamServerConfig {
   name: string;
-  command: string;
+  type?: 'stdio' | 'http';
+  command?: string;
+  cwd?: string;
   args?: string[];
   env?: Record<string, string>;
+  url?: string;
+  headers?: Record<string, string>;
 }
 
 export interface ResourceLimits {
@@ -115,7 +119,8 @@ export type ExtensionMessage =
   | { type: 'update_config'; config: GuardianConfig }
   | { type: 'approve_drift'; serverName: string; toolName: string; newHash: string }
   | { type: 'set_category'; serverName: string; toolName: string; category: string }
-  | { type: 'request_state' };
+  | { type: 'request_state' }
+  | { type: 'clear_logs' };
 
 export type ProxyMessage =
   | { type: 'proxy_started'; pid: number; port: number }

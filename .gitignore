@@ -16,6 +16,9 @@ out/
 mcp-guardian-db.json
 .mcp-guardian/
 
+# Personal project handbook (keep local, do not publish)
+docs/Agent-Guardian-Complete-Project-Handbook.docx
+
 # OS-specific files
 .DS_Store
 Thumbs.db

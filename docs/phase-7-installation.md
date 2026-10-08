@@ -31,7 +31,7 @@ agent-guardian config add-server --name everything --command npx --args-json '["
 agent-guardian config show
 ```
 
-Replace the name, command, and argument array with the MCP server you actually want to protect. On Windows PowerShell, single quotes around the JSON array prevent PowerShell from consuming its double quotes.
+Replace the name, command, and argument array with the MCP server you actually want to protect. On Windows PowerShell, single quotes around the JSON array prevent PowerShell from consuming its double quotes. For external Streamable HTTP endpoints, use `config add-server --name docs --url https://your-server.example/mcp`. In VS Code, **MCP Guardian: Add External MCP Server** performs this setup interactively. See [remote setup](remote-mcp-setup.md) for authentication, workspace routing and a real Microsoft Learn test.
 
 Guardian stores local configuration and audit data under `%USERPROFILE%\.mcp-guardian` by default. Set `MCP_GUARDIAN_STORAGE_PATH` on both the proxy and extension-side workflow only when an isolated store is required.
 
@@ -56,6 +56,8 @@ Create `.vscode/mcp.json` in the workspace:
 ```
 
 Run **MCP: List Servers**, start `agent-guardian`, and inspect its output if startup fails. Current VS Code MCP configuration is documented at <https://code.visualstudio.com/docs/agent-customization/mcp-servers>.
+
+On VS Code versions supporting MCP server providers, the Guardian extension also contributes an `agent-guardian` server automatically when the open workspace does not already configure one. This works in an empty Extension Development Host too. Its executable, storage directory, port, and explicit settings file come from the active extension, so no separate manual server entry is needed there. Reload the development host after building extension changes. The provider mechanism is documented at <https://code.visualstudio.com/api/extension-guides/ai/mcp#register-an-mcp-server-in-your-extension>.
 
 ### Cursor
 
@@ -151,5 +153,8 @@ For the narrated classroom flow, use [`../demo/README.md`](../demo/README.md).
 - **Client cannot find `agent-guardian`:** use the absolute path to `dist/cli.js` with `node`, or reinstall the tarball globally.
 - **No downstream tools appear:** run `agent-guardian config show` and inspect the MCP client output log.
 - **Approval immediately fails or expires:** start the VS Code extension dashboard before the client invokes the tool.
-- **Dashboard stays idle:** ensure only one extension instance owns port `1337`, and that `MCP_GUARDIAN_WS_DISABLED` is not set to `1`.
+- **Dashboard stays idle:** open the repository in the Extension Development Host and start the MCP server. Match `mcp-guardian.wsPort` with `MCP_GUARDIAN_WS_PORT` in the MCP launch configuration (the local development setup uses `1338`). The dashboard displays its connection port; the MCP log must say `Connected to VS Code extension on port ...`. Development environment overrides take precedence over extension setting defaults. Only one Guardian extension host can own that port.
+- **After moving the repository:** update any absolute storage and filesystem-server paths in `.vscode/settings.json`. The extension and proxy must use the same runtime directory. Set `MCP_GUARDIAN_WORKSPACE_SETTINGS_PATH` in the development launch environment to load the same configuration even if the development window opens without a folder.
+
+In development mode, Guardian also loads `.vscode/settings.json` from its source directory when no explicit workspace-settings environment path is supplied. This keeps a restored, empty development window on the project's port and configuration instead of silently using the global defaults.
 - **Browser demo lacks Chromium:** run `npx playwright install chromium`.

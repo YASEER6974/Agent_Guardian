@@ -137,3 +137,30 @@ test('re-baselining only promotes the exact currently observed definition hash',
   assert.equal(promoted.status, 'approved');
   assert.deepEqual(promoted.trustedDefinition, observed);
 });
+
+test('a stale dashboard configuration write preserves newly persisted proxy baselines and logs', () => {
+  const directory = temporaryDirectory();
+  const proxy = new GuardianDb(directory);
+  const dashboard = new GuardianDb(directory);
+  const definition = snapshotTool({ name: 'search', description: 'Search public documents', inputSchema: { type: 'object' } });
+  const hash = fingerprintTool(definition);
+  proxy.setToolBaseline('remote', 'search', { name: 'search', description: definition.description, inputSchema: definition.inputSchema,
+    hash, category: 'READ_NETWORK', approved: true, firstSeen: new Date().toISOString(), lastSeen: new Date().toISOString() });
+  proxy.addLog({ id: 'latest', timestamp: new Date().toISOString(), serverName: 'remote', toolName: 'search', category: 'READ_NETWORK', arguments: {}, status: 'allow' });
+  dashboard.updateConfig({ autoApproveSafe: false });
+  const stored = new GuardianDb(directory);
+  assert.equal(stored.getToolBaseline('remote', 'search').hash, hash);
+  assert.equal(stored.getLogs()[0].id, 'latest');
+  assert.equal(stored.getConfig().autoApproveSafe, false);
+});
+
+test('dashboard snapshot and log mirroring never overwrite the proxy database', () => {
+  const directory = temporaryDirectory();
+  const dashboard = new GuardianDb(directory);
+  const file = path.join(directory, 'mcp-guardian-db.json');
+  const before = fs.readFileSync(file, 'utf8');
+  dashboard.mirrorState({ baselines: {}, logs: [], config: dashboard.getConfig() });
+  dashboard.mirrorLog({ id: 'view-only', timestamp: new Date().toISOString(), serverName: 'remote', toolName: 'search', category: 'READ_NETWORK', arguments: {}, status: 'allow' });
+  assert.equal(dashboard.getLogs()[0].id, 'view-only');
+  assert.equal(fs.readFileSync(file, 'utf8'), before);
+});

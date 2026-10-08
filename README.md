@@ -14,6 +14,14 @@ npm run demo:headed
 
 The demo is intentionally isolated under [`demo/`](demo/) and uses the real Browser Guardian, policy engine, and hash-chained trace. It runs a malicious invoice twin and a benign authorized twin, proves whether the local side effects occurred, and writes readable PDF, HTML, and Markdown reports plus the raw JSON audit under `demo/output/`. The exact classroom walkthrough is in [`demo/README.md`](demo/README.md).
 
+## Remote HTTP MCP setup
+
+The proxy supports external Streamable HTTP MCP endpoints as well as local stdio servers. In VS Code, use **MCP Guardian: Add External MCP Server** to add a URL or command behind Guardian. **MCP Guardian: Guard Workspace MCP Servers** imports existing workspace connections, saves a backup, and replaces their direct entries with the Guardian proxy.
+
+For remote servers, rejected descriptions are withheld and definitions are checked again before tool calls to detect a rug pull during a session. Static authentication headers and environment-variable references are supported. The local remote example uses Microsoft Learn. See [remote setup and test prompts](docs/remote-mcp-setup.md).
+
+The client must connect through Guardian; direct global entries, private IDE tools and other clients are not automatically intercepted. The 15-day scheduled recheck remains separate future work.
+
 ## Research Goal
 
 Agent Guardian investigates this question:

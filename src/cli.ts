@@ -2,6 +2,9 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { GuardianDb } from './db';
+import { validateServer } from './server-config';
+import { readWorkspaceSettings } from './workspace-settings';
+import { applyEdits, modify } from 'jsonc-parser/lib/esm/main';
 import { parseAuditExport, ReportFormat, serializeReport, verifyAuditExport } from './reporting';
 
 export const EXIT_OK = 0;
@@ -40,15 +43,25 @@ function main(args = process.argv.slice(2)): number {
 function addServer(args: string[]): number {
   const name = option(args, '--name');
   const command = option(args, '--command');
+  const url = option(args, '--url');
   const argsJson = option(args, '--args-json') || '[]';
-  if (!name || !command) return usage('add-server requires --name and --command');
+  if (!name || (!command && !url) || (command && url)) return usage('add-server requires --name and either --command or --url');
   const serverArgs = JSON.parse(argsJson);
   if (!Array.isArray(serverArgs) || serverArgs.some(item => typeof item !== 'string')) {
     return usage('--args-json must be a JSON array of strings');
   }
   const database = databaseFor(args);
-  const existing = database.getConfig().servers.filter(server => server.name !== name);
-  database.updateConfig({ servers: [...existing, { name, command, args: serverArgs }] });
+  const settingsPath = option(args, '--workspace-settings') || process.env.MCP_GUARDIAN_WORKSPACE_SETTINGS_PATH;
+  if (settingsPath) database.updateConfig(readWorkspaceSettings(settingsPath, database.getConfig()));
+  const headers = JSON.parse(option(args, '--headers-json') || '{}');
+  const server = validateServer(url ? { name, type: 'http', url, ...(Object.keys(headers).length ? { headers } : {}) }
+    : { name, command, args: serverArgs });
+  const servers = [...database.getConfig().servers.filter(server => server.name !== name), server];
+  if (settingsPath) {
+    const original = fs.readFileSync(settingsPath, 'utf8');
+    fs.writeFileSync(settingsPath, applyEdits(original, modify(original, ['mcp-guardian.servers'], servers, { formattingOptions: { insertSpaces: true, tabSize: 2 } })), 'utf8');
+  }
+  database.updateConfig({ servers });
   process.stdout.write(`Configured downstream MCP server '${name}'\n`);
   return EXIT_OK;
 }
@@ -56,6 +69,10 @@ function addServer(args: string[]): number {
 function showConfig(args: string[]): number {
   const config = structuredClone(databaseFor(args).getConfig());
   if (config.geminiApiKey) config.geminiApiKey = '[configured]';
+  for (const server of config.servers) {
+    if (server.headers) server.headers = Object.fromEntries(Object.keys(server.headers).map(key => [key, '[REDACTED]']));
+    if (server.env) server.env = Object.fromEntries(Object.keys(server.env).map(key => [key, '[REDACTED]']));
+  }
   process.stdout.write(`${JSON.stringify(config, null, 2)}\n`);
   return EXIT_OK;
 }
@@ -105,6 +122,7 @@ function help(): string {
     '',
     '  agent-guardian proxy',
     '  agent-guardian config add-server --name <name> --command <command> [--args-json <json>] [--storage <directory>]',
+    '  agent-guardian config add-server --name <name> --url <http-mcp-url> [--headers-json <json>] [--storage <directory>] [--workspace-settings <file>]',
     '  agent-guardian config show [--storage <directory>]',
     '  agent-guardian report export --format json|jsonl|sarif --out <file> [--storage <directory>]',
     '  agent-guardian report verify --input <json-or-jsonl-file>',

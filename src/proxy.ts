@@ -5,9 +5,12 @@ import * as path from 'path';
 import * as readline from 'readline';
 import { ChildProcess, spawn } from 'child_process';
 import WebSocket from 'ws';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { createApprovalView, inferDestination, isTrustedDestination, resolveSessionPolicy } from './approval';
 import { CrossSurfaceStore } from './browser/cross-surface-store';
 import { GuardianDb } from './db';
+import { readWorkspaceSettings } from './workspace-settings';
+import { isHttpServer, resolveEnvironmentReferences, resolveHttpHeaders, validateServer } from './server-config';
 import {
   autoAssignCategory,
   checkTransition
@@ -40,8 +43,10 @@ type JsonRpcId = string | number | null;
 interface DownstreamRuntime {
   config: DownstreamServerConfig;
   signature: string;
-  process: ChildProcess;
-  reader: readline.Interface;
+  process?: ChildProcess;
+  reader?: readline.Interface;
+  http?: StreamableHTTPClientTransport;
+  ready?: Promise<void>;
 }
 
 interface PendingDownstreamRequest {
@@ -82,7 +87,7 @@ const WS_PORT = Number(process.env.MCP_GUARDIAN_WS_PORT) || 1337;
 const WORKSPACE_SETTINGS_PATH = process.env.MCP_GUARDIAN_WORKSPACE_SETTINGS_PATH;
 
 const db = new GuardianDb(STORAGE_PATH);
-if (WORKSPACE_SETTINGS_PATH) db.updateConfig(readWorkspaceSettings(WORKSPACE_SETTINGS_PATH));
+if (WORKSPACE_SETTINGS_PATH) db.updateConfig(readWorkspaceSettings(WORKSPACE_SETTINGS_PATH, db.getConfig()));
 const acceptedRisks = new AcceptedRiskStore(STORAGE_PATH);
 const crossSurfaceStore = new CrossSurfaceStore(STORAGE_PATH);
 const downstreams = new Map<string, DownstreamRuntime>();
@@ -109,31 +114,6 @@ const clientReader = readline.createInterface({ input: process.stdin, terminal: 
 
 function limits(): ResourceLimits {
   return { ...DEFAULT_LIMITS, ...(db.getConfig().resourceLimits || {}) };
-}
-
-function readWorkspaceSettings(settingsPath: string): Partial<GuardianConfig> {
-  const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8')) as Record<string, unknown>;
-  const servers = settings['mcp-guardian.servers'];
-  if (!Array.isArray(servers) || servers.length === 0 ||
-      servers.some(server => !server || typeof server.name !== 'string' || !server.name ||
-        typeof server.command !== 'string' || !server.command ||
-        (server.args !== undefined && (!Array.isArray(server.args) || server.args.some((arg: unknown) => typeof arg !== 'string'))))) {
-    throw new Error(`Workspace Guardian settings contain no valid downstream servers: ${settingsPath}`);
-  }
-  const current = db.getConfig();
-  return {
-    servers: servers as DownstreamServerConfig[],
-    autoApproveSafe: typeof settings['mcp-guardian.autoApproveSafe'] === 'boolean'
-      ? settings['mcp-guardian.autoApproveSafe'] : current.autoApproveSafe,
-    sessionPolicy: {
-      intent: typeof settings['mcp-guardian.sessionIntent'] === 'string'
-        ? settings['mcp-guardian.sessionIntent'] : current.sessionPolicy?.intent || '',
-      allowedCapabilities: Array.isArray(settings['mcp-guardian.allowedCapabilities'])
-        ? settings['mcp-guardian.allowedCapabilities'] as string[] : current.sessionPolicy?.allowedCapabilities || [],
-      trustedDestinations: Array.isArray(settings['mcp-guardian.trustedDestinations'])
-        ? settings['mcp-guardian.trustedDestinations'] as string[] : current.sessionPolicy?.trustedDestinations || []
-    }
-  };
 }
 
 function nextRequestId(): string {
@@ -192,7 +172,7 @@ function resolveCommand(command: string): string {
 }
 
 function serverSignature(config: DownstreamServerConfig): string {
-  return JSON.stringify({ command: config.command, args: config.args || [], env: config.env || {} });
+  return JSON.stringify(config);
 }
 
 function connectToExtension(): void {
@@ -278,10 +258,15 @@ function handleExtensionMessage(message: ExtensionMessage): void {
       // An explicitly supplied workspace file takes precedence over a stale
       // extension instance or a different VS Code window sharing this port.
       db.updateConfig({ ...message.config,
-        ...(WORKSPACE_SETTINGS_PATH ? readWorkspaceSettings(WORKSPACE_SETTINGS_PATH) : {}) });
+        ...(WORKSPACE_SETTINGS_PATH ? readWorkspaceSettings(WORKSPACE_SETTINGS_PATH, db.getConfig()) : {}) });
       syncDownstreamServers();
       return;
     case 'request_state':
+      db.refresh();
+      sendState();
+      return;
+    case 'clear_logs':
+      db.clearLogs();
       sendState();
   }
 }
@@ -298,6 +283,7 @@ function sendState(): void {
 function syncDownstreamServers(): void {
   const configured = db.getConfig().servers || [];
   const seen = new Set<string>();
+  let changed = false;
 
   for (const server of configured) {
     if (!server.name || seen.has(server.name)) {
@@ -309,29 +295,42 @@ function syncDownstreamServers(): void {
     const current = downstreams.get(server.name);
     const signature = serverSignature(server);
     if (current && current.signature === signature) continue;
+    changed = true;
     if (current) stopDownstreamServer(server.name, 'configuration changed');
     startDownstreamServer(server);
   }
 
   for (const name of downstreams.keys()) {
-    if (!seen.has(name)) stopDownstreamServer(name, 'removed from configuration');
+    if (!seen.has(name)) { changed = true; stopDownstreamServer(name, 'removed from configuration'); }
   }
   for (const name of failedDownstreams.keys()) {
     if (!seen.has(name)) failedDownstreams.delete(name);
   }
   resolveStartupConfig?.();
   resolveStartupConfig = undefined;
+  if (changed && clientHasInitialized) {
+    void Promise.allSettled(Array.from(downstreamInitialization.values())).then(() => {
+      if (!shuttingDown) writeToClient({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' });
+    });
+  }
 }
 
 function startDownstreamServer(config: DownstreamServerConfig): void {
-  const args = config.args || [];
-  const command = resolveCommand(config.command);
-  console.error(`[MCP-Guardian-Proxy] Starting downstream server '${config.name}' via ${command}`);
-
+  try {
+    validateServer(config);
+    if (isHttpServer(config)) { startHttpServer(config); return; }
+  } catch (error) {
+    failedDownstreams.set(config.name, error instanceof Error ? error.message : 'Invalid server configuration');
+    return;
+  }
   let child: ChildProcess;
   try {
+    const args = (config.args || []).map(resolveEnvironmentReferences);
+    const command = resolveCommand(resolveEnvironmentReferences(config.command!));
+    console.error(`[MCP-Guardian-Proxy] Starting downstream server '${config.name}' via ${command}`);
     child = spawn(command, args, {
-      env: { ...process.env, ...(config.env || {}) },
+      env: { ...process.env, ...Object.fromEntries(Object.entries(config.env || {}).map(([key, value]) => [key, resolveEnvironmentReferences(value)])) },
+      cwd: config.cwd,
       stdio: ['pipe', 'pipe', 'inherit'],
       shell: false,
       windowsHide: true
@@ -377,7 +376,8 @@ function startDownstreamServer(config: DownstreamServerConfig): void {
     failPendingForServer(config.name, new Error(`Server '${config.name}' failed: ${error.message}`));
   });
   child.once('close', code => {
-    if (downstreams.get(config.name)?.process === child) {
+    const isCurrent = downstreams.get(config.name)?.process === child;
+    if (isCurrent) {
       downstreams.delete(config.name);
       downstreamInitialization.delete(config.name);
       const reason = `Server '${config.name}' exited with code ${code}`;
@@ -385,9 +385,65 @@ function startDownstreamServer(config: DownstreamServerConfig): void {
       if (!shuttingDown && !failedDownstreams.has(config.name)) failedDownstreams.set(config.name, reason);
     }
     reader.close();
-    failPendingForServer(config.name, new Error(`Server '${config.name}' exited with code ${code}`));
-    sendToExtension({ type: 'downstream_status', serverName: config.name, status: 'disconnected' });
+    if (isCurrent) {
+      failPendingForServer(config.name, new Error(`Server '${config.name}' exited with code ${code}`));
+      sendToExtension({ type: 'downstream_status', serverName: config.name, status: 'disconnected' });
+    }
   });
+}
+
+function startHttpServer(config: DownstreamServerConfig): void {
+  const transport = new StreamableHTTPClientTransport(new URL(config.url!), {
+    requestInit: { headers: resolveHttpHeaders(config), redirect: 'error' },
+    fetch: async (url, options) => {
+      const signals = [options?.signal, options?.method === 'GET' ? undefined : AbortSignal.timeout(limits().requestTimeoutMs)]
+        .filter((signal): signal is AbortSignal => !!signal);
+      const response = await fetch(url, { ...options, redirect: 'error', signal: signals.length ? AbortSignal.any(signals) : undefined });
+      if (!response.body || options?.method === 'GET') return response;
+      const reader = response.body.getReader();
+      let bytes = 0;
+      const body = new ReadableStream<Uint8Array>({
+        async pull(controller) {
+          try {
+            const chunk = await reader.read();
+            if (chunk.done) { controller.close(); return; }
+            bytes += chunk.value.byteLength;
+            if (bytes > limits().maxMessageBytes) {
+              await reader.cancel();
+              controller.error(new Error('HTTP MCP response exceeded the size limit'));
+              return;
+            }
+            controller.enqueue(chunk.value);
+          } catch (error) { controller.error(error); }
+        },
+        cancel: reason => reader.cancel(reason)
+      });
+      return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
+    }
+  });
+  const runtime: DownstreamRuntime = { config, signature: serverSignature(config), http: transport };
+  downstreams.set(config.name, runtime);
+  console.error(`[MCP-Guardian-Proxy] Connecting HTTP MCP server '${config.name}'`);
+  transport.onmessage = message => {
+    if (downstreams.get(config.name) === runtime) handleDownstreamLine(config.name, JSON.stringify(message));
+  };
+  transport.onerror = () => sendToExtension({ type: 'downstream_status', serverName: config.name, status: 'error', error: 'HTTP MCP connection failed; inspect the client error' });
+  transport.onclose = () => {
+    if (downstreams.get(config.name) !== runtime) return;
+    downstreams.delete(config.name);
+    downstreamInitialization.delete(config.name);
+    failedDownstreams.set(config.name, 'HTTP MCP connection closed');
+    failPendingForServer(config.name, new Error('HTTP MCP connection closed'));
+    sendToExtension({ type: 'downstream_status', serverName: config.name, status: 'disconnected' });
+  };
+  runtime.ready = transport.start();
+  if (clientHasInitialized) void initializeDownstream(config.name).catch(error => failedDownstreams.set(config.name, error.message));
+}
+
+async function sendDownstream(runtime: DownstreamRuntime, message: any): Promise<void> {
+  if (runtime.http) { await runtime.ready; await runtime.http.send(message); return; }
+  if (!runtime.process?.stdin?.writable) throw new Error(`Server '${runtime.config.name}' is not running`);
+  await new Promise<void>((resolve, reject) => runtime.process!.stdin!.write(JSON.stringify(message) + '\n', error => error ? reject(error) : resolve()));
 }
 
 function stopDownstreamServer(name: string, reason: string): void {
@@ -395,8 +451,9 @@ function stopDownstreamServer(name: string, reason: string): void {
   if (!runtime) return;
   downstreams.delete(name);
   downstreamInitialization.delete(name);
-  runtime.reader.close();
-  runtime.process.kill();
+  runtime.reader?.close();
+  runtime.process?.kill();
+  if (runtime.http) void runtime.http.close();
   failPendingForServer(name, new Error(`Server '${name}' stopped: ${reason}`));
 }
 
@@ -427,6 +484,12 @@ function handleDownstreamLine(serverName: string, line: string): void {
     }
     clearTimeout(pending.timer);
     pendingDownstream.delete(message.id);
+    if (message.error) {
+      const inspected = inspectStructuredText(message.error, 'mcp.error-response', `error:${message.id}`, limits().maxScanStrings);
+      if (inspected.truncated || inspected.evidence.some(item => ['high', 'critical'].includes(item.severity))) {
+        message.error = { code: -32603, message: 'External MCP error content blocked by Agent Guardian' };
+      }
+    }
     pending.resolve(message);
     return;
   }
@@ -437,7 +500,7 @@ function handleDownstreamLine(serverName: string, line: string): void {
 
 function requestDownstream(serverName: string, method: string, params: unknown): Promise<any> {
   const runtime = downstreams.get(serverName);
-  if (!runtime || !runtime.process.stdin?.writable) {
+  if (!runtime) {
     return Promise.reject(new Error(`Server '${serverName}' is not running`));
   }
   const id = nextRequestId();
@@ -453,11 +516,10 @@ function requestDownstream(serverName: string, method: string, params: unknown):
       reject(new Error(`Server '${serverName}' timed out handling '${method}'`));
     }, limits().requestTimeoutMs);
     pendingDownstream.set(id, { serverName, method, timer, resolve, reject });
-    runtime.process.stdin!.write(serialized + '\n', error => {
-      if (!error) return;
+    void sendDownstream(runtime, request).catch(error => {
       clearTimeout(timer);
       pendingDownstream.delete(id);
-      reject(error);
+      reject(runtime.http ? new Error(`HTTP MCP '${serverName}' request '${method}' failed${typeof error.code === 'number' ? ` (HTTP ${error.code})` : ''}; check the endpoint and authentication configuration`) : error);
     });
   });
 }
@@ -467,8 +529,11 @@ function initializeDownstream(serverName: string): Promise<void> {
   if (existing) return existing;
   const initialized = requestDownstream(serverName, 'initialize', clientInitializeParams || {}).then(response => {
     if (response.error) throw new Error(`Server '${serverName}' rejected initialize: ${response.error.message}`);
+    const runtime = downstreams.get(serverName);
+    if (response.result?.protocolVersion) runtime?.http?.setProtocolVersion(response.result.protocolVersion);
+    sendToExtension({ type: 'downstream_status', serverName, status: 'connected' });
     if (clientHasInitialized) {
-      downstreams.get(serverName)?.process.stdin?.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
+      if (runtime) void sendDownstream(runtime, { jsonrpc: '2.0', method: 'notifications/initialized' }).catch(() => {});
     }
   });
   downstreamInitialization.set(serverName, initialized);
@@ -476,8 +541,10 @@ function initializeDownstream(serverName: string): Promise<void> {
 }
 
 function notifyDownstreams(method: string, params?: unknown): void {
-  const serialized = JSON.stringify({ jsonrpc: '2.0', method, ...(params === undefined ? {} : { params }) }) + '\n';
-  for (const runtime of downstreams.values()) runtime.process.stdin?.write(serialized);
+  const message = { jsonrpc: '2.0', method, ...(params === undefined ? {} : { params }) };
+  for (const runtime of downstreams.values()) void sendDownstream(runtime, message).catch(error => {
+    console.error(`[MCP-Guardian-Proxy] Notification to '${runtime.config.name}' failed: ${error.message}`);
+  });
 }
 
 clientReader.on('line', line => {
@@ -610,7 +677,7 @@ async function handleToolsList(message: any): Promise<void> {
   const results = await Promise.allSettled(
     serverNames.map(async serverName => ({
       serverName,
-      response: await requestDownstream(serverName, 'tools/list', message.params || {})
+      response: await listDownstreamTools(serverName, message.params || {})
     }))
   );
   const failures = results
@@ -631,7 +698,26 @@ async function handleToolsList(message: any): Promise<void> {
     registerTools(result.value.serverName, result.value.response.result?.tools || [], aggregatedTools);
   }
   applyShadowingRules();
+  sendState();
   writeToClient({ jsonrpc: '2.0', id: message.id, result: { tools: aggregatedTools } });
+}
+
+async function listDownstreamTools(serverName: string, params: any = {}): Promise<any> {
+  const tools: any[] = [];
+  const cursors = new Set<string>();
+  let cursor = params.cursor;
+  for (let page = 0; page < 40; page++) {
+    const response = await requestDownstream(serverName, 'tools/list', { ...params, ...(cursor ? { cursor } : {}) });
+    if (response.error) return response;
+    if (!Array.isArray(response.result?.tools)) throw new Error(`Server '${serverName}' returned an invalid tools list`);
+    tools.push(...response.result.tools);
+    if (Buffer.byteLength(JSON.stringify(tools)) > limits().maxMessageBytes) throw new Error('Aggregated tool definitions exceeded the size limit');
+    cursor = response.result.nextCursor;
+    if (!cursor) return { result: { tools } };
+    if (typeof cursor !== 'string' || cursors.has(cursor)) throw new Error('Invalid or repeated tool-list pagination cursor');
+    cursors.add(cursor);
+  }
+  throw new Error('Tool-list pagination limit reached; discovery is incomplete');
 }
 
 function registerTools(serverName: string, tools: any[], output: any[]): void {
@@ -659,6 +745,7 @@ function registerTools(serverName: string, tools: any[], output: any[]): void {
 
     if (!baseline) {
       const now = new Date().toISOString();
+      const assignedCategory = autoAssignCategory(tool.name, tool.description);
       const firstSeenPolicy = db.getConfig().firstSeenPolicy || 'approve-safe';
       const approved = onboarding.safe && firstSeenPolicy === 'approve-safe';
       const status = !onboarding.safe || firstSeenPolicy === 'block'
@@ -671,7 +758,7 @@ function registerTools(serverName: string, tools: any[], output: any[]): void {
         description: tool.description || '',
         inputSchema: tool.inputSchema || {},
         hash: currentHash,
-        category: autoAssignCategory(tool.name, tool.description),
+        category: isHttpServer(serverConfig) && assignedCategory === 'READ_LOCAL' ? 'READ_NETWORK' : assignedCategory,
         approved,
         firstSeen: now,
         lastSeen: now,
@@ -717,7 +804,10 @@ function registerTools(serverName: string, tools: any[], output: any[]): void {
 
     for (const finding of onboarding.evidence) reasons.push(finding.message);
 
-    output.push({ ...tool, name: prefixedName, description: `[MCP-Guardian: ${statusText}] ${tool.description || ''}` });
+    // Never expose a rejected or changed definition to the agent's context.
+    if (onboarding.safe && !isDrift && !['rejected', 'drifted'].includes(db.getToolBaseline(serverName, tool.name)?.status || '')) {
+      output.push({ ...tool, name: prefixedName, description: `[MCP-Guardian: ${statusText}] ${tool.description || ''}` });
+    }
     const stored = db.getToolBaseline(serverName, tool.name);
     if (isDrift || onboarding.evidence.length > 0 || !stored?.approved) {
       const auditLog: AuditLog = {
@@ -777,6 +867,22 @@ async function handleToolCall(message: any): Promise<void> {
   if (!mapping) {
     writeError(message.id ?? null, -32601, `Tool '${prefixedName}' was not discovered`);
     return;
+  }
+
+  if (downstreams.get(mapping.serverName)?.http) {
+    try {
+      const refreshed = await listDownstreamTools(mapping.serverName);
+      if (refreshed.error) throw new Error('Remote MCP rejected metadata refresh');
+      registerTools(mapping.serverName, refreshed.result.tools, []);
+      applyShadowingRules();
+      sendState();
+      if (!refreshed.result.tools.some((tool: any) => tool.name === mapping.originalName)) {
+        throw new Error('Remote tool disappeared; restart discovery before calling it');
+      }
+    } catch (error) {
+      writeError(message.id ?? null, -32603, `Remote tool metadata could not be verified: ${error instanceof Error ? error.message : 'refresh failed'}`);
+      return;
+    }
   }
 
   const args = message.params?.arguments || {};

@@ -496,9 +496,11 @@
     </div>
     <div id="connection-status" class="connection-badge">
       <span class="connection-dot"></span>
-      <span id="connection-text">SHIELD DIAL OFF</span>
+      <span id="connection-text">SHIELD IDLE</span>
     </div>
   </div>
+
+  <div id="connection-detail" style="font-size: 10px; color: var(--text-muted); margin: 0 20px 12px; overflow-wrap: anywhere;">Waiting for the MCP proxy.</div>
 
   <!-- Navigation Tabs -->
   <div class="tabs">
@@ -527,7 +529,7 @@
         <div id="stat-blocked" class="status-val">0</div>
       </div>
       <div class="status-card">
-        <div style="font-size: 10px; color: var(--text-muted); text-transform: uppercase;">Active Servers</div>
+        <div style="font-size: 10px; color: var(--text-muted); text-transform: uppercase;">Configured Servers</div>
         <div id="stat-servers" class="status-val">0</div>
       </div>
       <div class="status-card">
@@ -573,6 +575,11 @@
 
   <!-- Tab Content: Setup & Servers -->
   <div id="tab-setup" class="tab-content">
+    <div style="display: flex; gap: 8px; margin-bottom: 12px;">
+      <button class="btn btn-secondary" onclick="vscode.postMessage({type: 'add_external_server'})">Add External MCP</button>
+      <button class="btn btn-secondary" onclick="vscode.postMessage({type: 'guard_workspace_servers'})">Guard Workspace MCPs</button>
+    </div>
+    <div style="color: var(--text-muted); margin-bottom: 12px;">AI agent → Agent Guardian → external MCP server. Add remote HTTP URLs or local server commands here.</div>
     <div class="section-title">
       <span>Downstream MCP Server Status</span>
     </div>
@@ -700,6 +707,9 @@
       // 1. Connection Status Badge
       const statusBadge = document.getElementById('connection-status');
       const statusText = document.getElementById('connection-text');
+      statusBadge.title = currentState.connectionError ||
+        `Dashboard port ${currentState.connectionPort || 1337}. ${currentState.proxyConnected ? 'MCP proxy connected.' : 'Waiting for the MCP proxy to connect.'}`;
+      document.getElementById('connection-detail').textContent = statusBadge.title;
       if (currentState.proxyConnected) {
         statusBadge.classList.add('connected');
         statusText.textContent = 'SHIELD ACTIVE';
@@ -829,7 +839,7 @@
                 </select>
               </div>
               <div style="font-size: 11px; color: var(--text-muted); line-height: 1.3; margin-bottom: 4px;">
-                ${baseline.description || 'No description provided.'}
+                ${escapeHtml(baseline.description || 'No description provided.')}
               </div>
               <div style="font-family: monospace; font-size: 10px; color: #64748b;">
                 SHA-256: ${baseline.hash.substring(0, 16)}...
@@ -860,12 +870,12 @@
         serversContainer.innerHTML = currentState.config.servers.map(srv => `
           <div class="server-item">
             <div class="server-info">
-              <span class="server-name">${srv.name}</span>
-              <span class="server-cmd">${srv.command} ${(srv.args || []).join(' ')}</span>
+              <span class="server-name">${escapeHtml(srv.name)}</span>
+              <span class="server-cmd">${escapeHtml(srv.url ? `HTTP: ${srv.url}` : `${srv.command} ${(srv.args || []).join(' ')}`)}</span>
             </div>
-            <div class="connection-badge connected">
+            <div class="connection-badge">
               <span class="connection-dot"></span>
-              <span>Running</span>
+              <span>Configured</span>
             </div>
           </div>
         `).join('');
